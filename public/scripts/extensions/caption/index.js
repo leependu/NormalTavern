@@ -1,6 +1,6 @@
-import { ensureImageFormatSupported, getBase64Async, isTrueBoolean, saveBase64AsFile } from '../../utils.js';
+import { ensureImageFormatSupported, getBase64Async, getFileExtension, isTrueBoolean, saveBase64AsFile } from '../../utils.js';
 import { getContext, getApiUrl, doExtrasFetch, extension_settings, modules, renderExtensionTemplateAsync } from '../../extensions.js';
-import { appendMediaToMessage, callPopup, eventSource, event_types, getRequestHeaders, saveChatConditional, saveSettingsDebounced, substituteParamsExtended } from '../../../script.js';
+import { appendMediaToMessage, eventSource, event_types, getRequestHeaders, saveChatConditional, saveSettingsDebounced, substituteParamsExtended } from '../../../script.js';
 import { getMessageTimeStamp } from '../../RossAscends-mods.js';
 import { SECRET_KEYS, secret_state } from '../../secrets.js';
 import { getMultimodalCaption } from '../shared.js';
@@ -9,6 +9,7 @@ import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
 import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { callGenericPopup, Popup, POPUP_TYPE } from '../../popup.js';
 export { MODULE_NAME };
 
 const MODULE_NAME = 'caption';
@@ -51,6 +52,10 @@ function migrateSettings() {
 
     if (!extension_settings.caption.template) {
         extension_settings.caption.template = TEMPLATE_DEFAULT;
+    }
+
+    if (!extension_settings.caption.show_in_chat) {
+        extension_settings.caption.show_in_chat = false;
     }
 }
 
@@ -98,9 +103,9 @@ async function wrapCaptionTemplate(caption) {
     let messageText = substituteParamsExtended(template, { caption: caption });
 
     if (extension_settings.caption.refine_mode) {
-        messageText = await callPopup(
-            '<h3>Review and edit the generated caption:</h3>Press "Cancel" to abort the caption sending.',
-            'input',
+        messageText = await Popup.show.input(
+            'Review and edit the generated caption:',
+            'Press "Cancel" to abort the caption sending.',
             messageText,
             { rows: 5, okButton: 'Send' });
 
@@ -166,6 +171,7 @@ async function sendCaptionedMessage(caption, image) {
         extra: {
             image: image,
             title: messageText,
+            inline_image: !!extension_settings.caption.show_in_chat,
         },
     };
     context.chat.push(message);
@@ -278,7 +284,7 @@ async function captionMultimodal(base64Img, externalPrompt) {
     let prompt = externalPrompt || extension_settings.caption.prompt || PROMPT_DEFAULT;
 
     if (!externalPrompt && extension_settings.caption.prompt_ask) {
-        const customPrompt = await callPopup('<h3>Enter a comment or question:</h3>', 'input', prompt, { rows: 2 });
+        const customPrompt = await callGenericPopup('Enter a comment or question:', POPUP_TYPE.INPUT, prompt, { rows: 2 });
         if (!customPrompt) {
             throw new Error('User aborted the caption sending.');
         }
@@ -326,11 +332,11 @@ async function getCaptionForFile(file, prompt, quiet) {
         setSpinnerIcon();
         const context = getContext();
         const fileData = await getBase64Async(await ensureImageFormatSupported(file));
-        const base64Format = fileData.split(',')[0].split(';')[0].split('/')[1];
+        const extension = getFileExtension(file);
         const base64Data = fileData.split(',')[1];
         const { caption } = await doCaptionRequest(base64Data, fileData, prompt);
         if (!quiet) {
-            const imagePath = await saveBase64AsFile(base64Data, context.name2, '', base64Format);
+            const imagePath = await saveBase64AsFile(base64Data, context.name2, '', extension);
             await sendCaptionedMessage(caption, imagePath);
         }
         return caption;
@@ -408,13 +414,17 @@ jQuery(async function () {
                 // Handle multimodal sources
                 if (settings.source === 'multimodal') {
                     const api = settings.multimodal_api;
+                    const altEndpointEnabled = settings.alt_endpoint_enabled;
+                    const altEndpointUrl = settings.alt_endpoint_url;
 
                     // APIs that support reverse proxy
                     const reverseProxyApis = {
                         'openai': SECRET_KEYS.OPENAI,
                         'mistral': SECRET_KEYS.MISTRALAI,
                         'google': SECRET_KEYS.MAKERSUITE,
+                        'vertexai': SECRET_KEYS.VERTEXAI,
                         'anthropic': SECRET_KEYS.CLAUDE,
+                        'xai': SECRET_KEYS.XAI,
                     };
 
                     if (reverseProxyApis[api]) {
@@ -428,6 +438,7 @@ jQuery(async function () {
                         'zerooneai': SECRET_KEYS.ZEROONEAI,
                         'groq': SECRET_KEYS.GROQ,
                         'cohere': SECRET_KEYS.COHERE,
+                        'aimlapi': SECRET_KEYS.AIMLAPI,
                     };
 
                     if (chatCompletionApis[api] && secret_state[chatCompletionApis[api]]) {
@@ -442,12 +453,16 @@ jQuery(async function () {
                         'vllm': textgen_types.VLLM,
                     };
 
-                    if (textCompletionApis[api] && textgenerationwebui_settings.server_urls[textCompletionApis[api]]) {
+                    if (textCompletionApis[api] && altEndpointEnabled && altEndpointUrl) {
+                        return true;
+                    }
+
+                    if (textCompletionApis[api] && !altEndpointEnabled && textgenerationwebui_settings.server_urls[textCompletionApis[api]]) {
                         return true;
                     }
 
                     // Custom API doesn't need additional checks
-                    if (api === 'custom') {
+                    if (api === 'custom' || api === 'pollinations') {
                         return true;
                     }
                 }
@@ -576,6 +591,18 @@ jQuery(async function () {
     });
     $('#caption_multimodal_model').on('change', () => {
         extension_settings.caption.multimodal_model = String($('#caption_multimodal_model').val());
+        saveSettingsDebounced();
+    });
+    $('#caption_altEndpoint_url').val(extension_settings.caption.alt_endpoint_url).on('input', () => {
+        extension_settings.caption.alt_endpoint_url = String($('#caption_altEndpoint_url').val());
+        saveSettingsDebounced();
+    });
+    $('#caption_altEndpoint_enabled').prop('checked', !!(extension_settings.caption.alt_endpoint_enabled)).on('input', () => {
+        extension_settings.caption.alt_endpoint_enabled = !!$('#caption_altEndpoint_enabled').prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#caption_show_in_chat').prop('checked', !!(extension_settings.caption.show_in_chat)).on('input', () => {
+        extension_settings.caption.show_in_chat = !!$('#caption_show_in_chat').prop('checked');
         saveSettingsDebounced();
     });
 

@@ -10,7 +10,6 @@ import {
     INFERMATICAI_KEYS,
     OPENROUTER_KEYS,
     VLLM_KEYS,
-    DREAMGEN_KEYS,
     FEATHERLESS_KEYS,
     OPENAI_KEYS,
 } from '../../constants.js';
@@ -340,9 +339,6 @@ router.post('/generate', async function (request, response) {
         }
 
         if (request.body.api_type === TEXTGEN_TYPES.DREAMGEN) {
-            request.body = _.pickBy(request.body, (_, key) => DREAMGEN_KEYS.includes(key));
-            // NOTE: DreamGen sometimes get confused by the unusual formatting in the character cards.
-            request.body.stop?.push('### User', '## User');
             args.body = JSON.stringify(request.body);
         }
 
@@ -450,7 +446,7 @@ ollama.post('/download', async function (request, response) {
 
         if (!fetchResponse.ok) {
             console.error('Download error:', fetchResponse.status, fetchResponse.statusText);
-            return response.status(fetchResponse.status).send({ error: true });
+            return response.status(500).send({ error: true });
         }
 
         console.debug('Ollama pull response:', await fetchResponse.json());
@@ -505,51 +501,6 @@ ollama.post('/caption-image', async function (request, response) {
 });
 
 const llamacpp = express.Router();
-
-llamacpp.post('/caption-image', async function (request, response) {
-    try {
-        if (!request.body.server_url) {
-            return response.sendStatus(400);
-        }
-
-        console.debug('LlamaCpp caption request:', request.body);
-        const baseUrl = trimV1(request.body.server_url);
-
-        const fetchResponse = await fetch(`${baseUrl}/completion`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                prompt: `USER:[img-1]${String(request.body.prompt).trim()}\nASSISTANT:`,
-                image_data: [{ data: request.body.image, id: 1 }],
-                temperature: 0.1,
-                stream: false,
-                stop: ['USER:', '</s>'],
-            }),
-        });
-
-        if (!fetchResponse.ok) {
-            console.error('LlamaCpp caption error:', fetchResponse.status, fetchResponse.statusText);
-            return response.status(500).send({ error: true });
-        }
-
-        /** @type {any} */
-        const data = await fetchResponse.json();
-        console.debug('LlamaCpp caption response:', data);
-
-        const caption = data?.content || '';
-
-        if (!caption) {
-            console.error('LlamaCpp caption is empty.');
-            return response.status(500).send({ error: true });
-        }
-
-        return response.send({ caption });
-
-    } catch (error) {
-        console.error(error);
-        return response.sendStatus(500);
-    }
-});
 
 llamacpp.post('/props', async function (request, response) {
     try {
@@ -659,14 +610,14 @@ tabby.post('/download', async function (request, response) {
             }
         } else {
             console.error('API Permission error:', permissionResponse.status, permissionResponse.statusText);
-            return response.status(permissionResponse.status).send({ error: true });
+            return response.status(500).send({ error: true });
         }
 
         const fetchResponse = await fetch(`${baseUrl}/v1/download`, args);
 
         if (!fetchResponse.ok) {
             console.error('Download error:', fetchResponse.status, fetchResponse.statusText);
-            return response.status(fetchResponse.status).send({ error: true });
+            return response.status(500).send({ error: true });
         }
 
         return response.send({ ok: true });

@@ -1,6 +1,6 @@
 // Move chat functions here from script.js (eventually)
 
-import { Popper, css } from '../lib.js';
+import { Popper, css, DOMPurify } from '../lib.js';
 import {
     addCopyToCodeBlocks,
     appendMediaToMessage,
@@ -23,6 +23,11 @@ import {
     neutralCharacterName,
     updateChatMetadata,
     system_message_types,
+    converter,
+    substituteParams,
+    getSystemMessageByType,
+    printMessages,
+    clearChat,
 } from '../script.js';
 import { selected_group } from './group-chats.js';
 import { power_user } from './power-user.js';
@@ -37,6 +42,9 @@ import {
     saveBase64AsFile,
     extractTextFromOffice,
     download,
+    getFileText,
+    getFileExtension,
+    convertTextToBase64,
 } from './utils.js';
 import { extension_settings, renderExtensionTemplateAsync, saveMetadataDebounced } from './extensions.js';
 import { POPUP_RESULT, POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
@@ -62,7 +70,7 @@ import { accountStorage } from './util/AccountStorage.js';
  * @returns {Promise<string>} Converted file text
  */
 
-const fileSizeLimit = 1024 * 1024 * 100; // 100 MB
+const fileSizeLimit = 1024 * 1024 * 350; // 350 MB
 const ATTACHMENT_SOURCE = {
     GLOBAL: 'global',
     CHARACTER: 'character',
@@ -198,13 +206,18 @@ export async function populateFileAttachment(message, inputId = 'file_form_input
         const fileNamePrefix = `${Date.now()}_${slug}`;
         const fileBase64 = await getBase64Async(file);
         let base64Data = fileBase64.split(',')[1];
+        const extension = getFileExtension(file);
 
         // If file is image
         if (file.type.startsWith('image/')) {
-            const extension = file.type.split('/')[1];
             const imageUrl = await saveBase64AsFile(base64Data, name2, fileNamePrefix, extension);
             message.extra.image = imageUrl;
             message.extra.inline_image = true;
+        }
+        // If file is video
+        else if (file.type.startsWith('video/')) {
+            const videoUrl = await saveBase64AsFile(base64Data, name2, fileNamePrefix, extension);
+            message.extra.video = videoUrl;
         } else {
             const uniqueFileName = `${fileNamePrefix}.txt`;
 
@@ -212,7 +225,7 @@ export async function populateFileAttachment(message, inputId = 'file_form_input
                 try {
                     const converter = getConverter(file.type);
                     const fileText = await converter(file);
-                    base64Data = window.btoa(unescape(encodeURIComponent(fileText)));
+                    base64Data = convertTextToBase64(fileText);
                 } catch (error) {
                     toastr.error(String(error), t`Could not convert file`);
                     console.error('Could not convert file', error);
@@ -235,6 +248,7 @@ export async function populateFileAttachment(message, inputId = 'file_form_input
 
     } catch (error) {
         console.error('Could not upload file', error);
+        toastr.error(t`Either the file is corrupted or its format is not supported.`, t`Could not upload the file`);
     } finally {
         $('#file_form').trigger('reset');
     }
@@ -347,10 +361,13 @@ async function onFileAttach(file) {
     $('#file_form .file_size').text(humanFileSize(file.size));
     $('#file_form').removeClass('displayNone');
 
-    // Reset form on chat change
-    eventSource.once(event_types.CHAT_CHANGED, () => {
-        $('#file_form').trigger('reset');
-    });
+    // Reset form on chat change (if not on a welcome screen)
+    const currentChatId = getCurrentChatId();
+    if (currentChatId) {
+        eventSource.once(event_types.CHAT_CHANGED, () => {
+            $('#file_form').trigger('reset');
+        });
+    }
 }
 
 /**
@@ -459,19 +476,21 @@ export async function appendFileContent(message, messageText) {
  * @copyright https://github.com/kwaroran/risuAI
  */
 export function encodeStyleTags(text) {
-    const styleRegex = /<style>(.+?)<\/style>/gms;
+    const styleRegex = /<style>(.+?)<\/style>/gims;
     return text.replaceAll(styleRegex, (_, match) => {
-        return `<custom-style>${escape(match)}</custom-style>`;
+        return `<custom-style>${encodeURIComponent(match)}</custom-style>`;
     });
 }
 
 /**
  * Sanitizes custom style tags in the message text to prevent DOM pollution.
  * @param {string} text Message text
+ * @param {object} options Options object
+ * @param {string} options.prefix Prefix the selectors with this value
  * @returns {string} Sanitized message text
  * @copyright https://github.com/kwaroran/risuAI
  */
-export function decodeStyleTags(text) {
+export function decodeStyleTags(text, { prefix } = { prefix: '.mes_text ' }) {
     const styleDecodeRegex = /<custom-style>(.+?)<\/custom-style>/gms;
     const mediaAllowed = isExternalMediaAllowed();
 
@@ -480,20 +499,43 @@ export function decodeStyleTags(text) {
             for (let i = 0; i < rule.selectors.length; i++) {
                 const selector = rule.selectors[i];
                 if (selector) {
-                    const selectors = (selector.split(' ') ?? []).map((v) => {
-                        if (v.startsWith('.')) {
-                            return '.custom-' + v.substring(1);
-                        }
-                        return v;
-                    }).join(' ');
-
-                    rule.selectors[i] = '.mes_text ' + selectors;
+                    rule.selectors[i] = prefix + sanitizeSelector(selector);
                 }
             }
         }
         if (!mediaAllowed && Array.isArray(rule.declarations) && rule.declarations.length > 0) {
             rule.declarations = rule.declarations.filter(declaration => !declaration.value.includes('://'));
         }
+    }
+
+    function sanitizeSelector(selector) {
+        // Handle pseudo-classes that can contain nested selectors
+        const pseudoClasses = ['has', 'not', 'where', 'is', 'matches', 'any'];
+        const pseudoRegex = new RegExp(`:(${pseudoClasses.join('|')})\\(([^)]+)\\)`, 'g');
+
+        // First, sanitize any nested selectors within pseudo-classes
+        selector = selector.replace(pseudoRegex, (match, pseudoClass, content) => {
+            // Recursively sanitize the content within the pseudo-class
+            const sanitizedContent = sanitizeSimpleSelector(content);
+            return `:${pseudoClass}(${sanitizedContent})`;
+        });
+
+        // Then sanitize the main selector parts
+        return sanitizeSimpleSelector(selector);
+    }
+
+    function sanitizeSimpleSelector(selector) {
+        // Split by spaces but preserve complex selectors
+        return selector.split(/\s+/).map((part) => {
+            // Handle class selectors, but preserve pseudo-classes and other complex parts
+            return part.replace(/\.([\w-]+)/g, (match, className) => {
+                // Don't modify if it's already prefixed with 'custom-'
+                if (className.startsWith('custom-')) {
+                    return match;
+                }
+                return `.custom-${className}`;
+            });
+        }).join(' ');
     }
 
     function sanitizeRuleSet(ruleSet) {
@@ -512,7 +554,7 @@ export function decodeStyleTags(text) {
 
     return text.replaceAll(styleDecodeRegex, (_, style) => {
         try {
-            let styleCleaned = unescape(style).replaceAll(/<br\/>/g, '');
+            let styleCleaned = decodeURIComponent(style).replaceAll(/<br\/>/g, '');
             const ast = css.parse(styleCleaned);
             const sheet = ast?.stylesheet;
             if (sheet) {
@@ -523,6 +565,200 @@ export function decodeStyleTags(text) {
             return `CSS ERROR: ${error}`;
         }
     });
+}
+
+/**
+ * Class to manage style preferences for characters.
+ */
+class StylesPreference {
+    /**
+     * Creates a new StylesPreference instance.
+     * @param {string|null} avatarId - The avatar ID of the character
+     */
+    constructor(avatarId) {
+        this.avatarId = avatarId;
+    }
+
+    /**
+     * Gets the account storage key for the style preference.
+     */
+    get key() {
+        return `AllowGlobalStyles-${this.avatarId}`;
+    }
+
+    /**
+     * Checks if a preference exists for this character.
+     * @returns {boolean} True if preference exists, false otherwise
+     */
+    exists() {
+        return this.avatarId
+            ? accountStorage.getItem(this.key) !== null
+            : true; // No character == assume preference is set
+    }
+
+    /**
+     * Gets the current style preference.
+     * @returns {boolean} True if global styles are allowed, false otherwise
+     */
+    get() {
+        return this.avatarId
+            ? accountStorage.getItem(this.key) === 'true'
+            : false; // Always disabled when creating a new character
+    }
+
+    /**
+     * Sets the global styles preference.
+     * @param {boolean} allowed - Whether global styles are allowed
+     */
+    set(allowed) {
+        if (this.avatarId) {
+            accountStorage.setItem(this.key, String(allowed));
+        }
+    }
+}
+
+/**
+ * Formats creator notes in the message text.
+ * @param {string} text Raw Markdown text
+ * @param {string} avatarId Avatar ID
+ * @returns {string} Formatted HTML text
+ */
+export function formatCreatorNotes(text, avatarId) {
+    const preference = new StylesPreference(avatarId);
+    const sanitizeStyles = !preference.get();
+    const decodeStyleParam = { prefix: sanitizeStyles ? '#creator_notes_spoiler ' : '' };
+    /** @type {import('dompurify').Config & { MESSAGE_SANITIZE: boolean }} */
+    const config = {
+        RETURN_DOM: false,
+        RETURN_DOM_FRAGMENT: false,
+        RETURN_TRUSTED_TYPE: false,
+        MESSAGE_SANITIZE: true,
+        ADD_TAGS: ['custom-style'],
+    };
+
+    let html = converter.makeHtml(substituteParams(text));
+    html = encodeStyleTags(html);
+    html = DOMPurify.sanitize(html, config);
+    html = decodeStyleTags(html, decodeStyleParam);
+
+    return html;
+}
+
+async function openGlobalStylesPreferenceDialog() {
+    if (selected_group) {
+        toastr.info(t`To change the global styles preference, please select a character individually.`);
+        return;
+    }
+
+    const entityId = getCurrentEntityId();
+    const preference = new StylesPreference(entityId);
+    const currentValue = preference.get();
+
+    const template = $(await renderTemplateAsync('globalStylesPreference'));
+
+    const allowedRadio = template.find('#global_styles_allowed');
+    const forbiddenRadio = template.find('#global_styles_forbidden');
+
+    allowedRadio.on('change', () => {
+        preference.set(true);
+        allowedRadio.prop('checked', true);
+        forbiddenRadio.prop('checked', false);
+    });
+
+    forbiddenRadio.on('change', () => {
+        preference.set(false);
+        allowedRadio.prop('checked', false);
+        forbiddenRadio.prop('checked', true);
+    });
+
+    const currentPreferenceRadio = currentValue ? allowedRadio : forbiddenRadio;
+    template.find(currentPreferenceRadio).prop('checked', true);
+
+    await callGenericPopup(template, POPUP_TYPE.TEXT, '', { wide: false, large: false });
+
+    // Re-render the notes if the preference changed
+    const newValue = preference.get();
+    if (newValue !== currentValue) {
+        $('#rm_button_selected_ch').trigger('click');
+        setGlobalStylesButtonClass(newValue);
+    }
+}
+
+async function checkForCreatorNotesStyles() {
+    // Don't do anything if in group chat or not in a chat
+    if (selected_group || this_chid === undefined) {
+        return;
+    }
+
+    const notes = characters[this_chid].data?.creator_notes || characters[this_chid].creatorcomment;
+    const avatarId = characters[this_chid].avatar;
+    const styleContents = getStyleContentsFromMarkdown(notes);
+
+    if (!styleContents) {
+        setGlobalStylesButtonClass(null);
+        return;
+    }
+
+    const preference = new StylesPreference(avatarId);
+    const hasPreference = preference.exists();
+    if (!hasPreference) {
+        const template = $(await renderTemplateAsync('globalStylesPopup'));
+        template.find('textarea').val(styleContents);
+        const confirmResult = await callGenericPopup(template, POPUP_TYPE.CONFIRM, '', {
+            wide: false,
+            large: false,
+            okButton: t`Just to Creator's Notes`,
+            cancelButton: t`Apply to the entire app`,
+        });
+
+        switch (confirmResult) {
+            case POPUP_RESULT.AFFIRMATIVE:
+                preference.set(false);
+                break;
+            case POPUP_RESULT.NEGATIVE:
+                preference.set(true);
+                break;
+            case POPUP_RESULT.CANCELLED:
+                preference.set(false);
+                break;
+        }
+
+        $('#rm_button_selected_ch').trigger('click');
+    }
+
+    const currentPreference = preference.get();
+    setGlobalStylesButtonClass(currentPreference);
+}
+
+/**
+ * Sets the class of the global styles button based on the state.
+ * @param {boolean|null} state State of the button
+ */
+function setGlobalStylesButtonClass(state) {
+    const button = $('#creators_note_styles_button');
+    button.toggleClass('empty', state === null);
+    button.toggleClass('allowed', state === true);
+    button.toggleClass('forbidden', state === false);
+}
+
+/**
+ * Extracts the contents of all style elements from the Markdown text.
+ * @param {string} text Markdown text
+ * @returns {string} The joined contents of all style elements
+ */
+function getStyleContentsFromMarkdown(text) {
+    if (!text) {
+        return '';
+    }
+
+    const div = document.createElement('div');
+    const html = converter.makeHtml(substituteParams(text));
+    div.innerHTML = html;
+    const styleElements = Array.from(div.querySelectorAll('style'));
+    return styleElements
+        .filter(s => s.textContent.trim().length > 0)
+        .map(s => s.textContent.trim())
+        .join('\n\n');
 }
 
 async function openExternalMediaOverridesDialog() {
@@ -575,8 +811,8 @@ export function isExternalMediaAllowed() {
     return !power_user.forbid_external_media;
 }
 
-async function enlargeMessageImage() {
-    const mesBlock = $(this).closest('.mes');
+function expandMessageImage(event) {
+    const mesBlock = $(event.currentTarget).closest('.mes');
     const mesId = mesBlock.attr('mesid');
     const message = chat[mesId];
     const imgSrc = message?.extra?.image;
@@ -620,7 +856,12 @@ async function enlargeMessageImage() {
         popup.completeCancelled();
     });
 
-    await popup.show();
+    popup.show();
+    return img;
+}
+
+function expandAndZoomMessageImage(event) {
+    expandMessageImage(event).click();
 }
 
 async function deleteMessageImage() {
@@ -673,6 +914,27 @@ async function deleteMessageImage() {
     } else {
         appendMediaToMessage(message, mesBlock);
     }
+
+    await saveChatConditional();
+}
+
+async function deleteMessageVideo() {
+    const confirm = await Popup.show.confirm(t`Delete video from message?`, t`This action can't be undone.`);
+    if (!confirm) {
+        return;
+    }
+
+    const mesBlock = $(this).closest('.mes');
+    const mesId = mesBlock.attr('mesid');
+    const message = chat[mesId];
+
+    if (!message?.extra?.video) {
+        console.warn('Message has no video or it is empty');
+        return;
+    }
+
+    delete message.extra.video;
+    mesBlock.find('.mes_video_container').remove();
 
     await saveChatConditional();
 }
@@ -1025,12 +1287,12 @@ async function openAttachmentManager() {
                 popper.update();
             });
 
-            return [popper, bodyListener];
+            return { popper, bodyListener };
         }).filter(Boolean);
 
         return () => {
             modalButtonData.forEach(p => {
-                const [popper, bodyListener] = p;
+                const { popper, bodyListener } = p;
                 popper.destroy();
                 document.body.removeEventListener('click', bodyListener);
             });
@@ -1259,14 +1521,14 @@ export async function uploadFileAttachmentToServer(file, target) {
         try {
             const converter = getConverter(file.type);
             const fileText = await converter(file);
-            base64Data = window.btoa(unescape(encodeURIComponent(fileText)));
+            base64Data = convertTextToBase64(fileText);
         } catch (error) {
             toastr.error(String(error), t`Could not convert file`);
             console.error('Could not convert file', error);
         }
     } else {
         const fileText = await file.text();
-        base64Data = window.btoa(unescape(encodeURIComponent(fileText)));
+        base64Data = convertTextToBase64(fileText);
     }
 
     const fileUrl = await uploadFileAttachment(uniqueFileName, base64Data);
@@ -1454,7 +1716,133 @@ export function registerFileConverter(mimeType, converter) {
     converters[mimeType] = converter;
 }
 
-jQuery(function () {
+export function addDOMPurifyHooks() {
+    // Allow target="_blank" in links
+    DOMPurify.addHook('afterSanitizeAttributes', function (node) {
+        if ('target' in node) {
+            node.setAttribute('target', '_blank');
+            node.setAttribute('rel', 'noopener');
+        }
+    });
+
+    DOMPurify.addHook('uponSanitizeAttribute', (node, data, config) => {
+        if (!config['MESSAGE_SANITIZE']) {
+            return;
+        }
+
+        /* Retain the classes on UI elements of messages that interact with the main UI */
+        const permittedNodeTypes = ['BUTTON', 'DIV'];
+        if (config['MESSAGE_ALLOW_SYSTEM_UI'] && node.classList.contains('menu_button') && permittedNodeTypes.includes(node.nodeName)) {
+            return;
+        }
+
+        switch (data.attrName) {
+            case 'class': {
+                if (data.attrValue) {
+                    data.attrValue = data.attrValue.split(' ').map((v) => {
+                        if (v.startsWith('fa-') || v.startsWith('note-') || v === 'monospace') {
+                            return v;
+                        }
+
+                        return 'custom-' + v;
+                    }).join(' ');
+                }
+                break;
+            }
+        }
+    });
+
+    DOMPurify.addHook('uponSanitizeElement', (node, _, config) => {
+        if (!config['MESSAGE_SANITIZE']) {
+            return;
+        }
+
+        // Replace line breaks with <br> in unknown elements
+        if (node instanceof HTMLUnknownElement) {
+            node.innerHTML = node.innerHTML.trim().replaceAll('\n', '<br>');
+        }
+
+        const isMediaAllowed = isExternalMediaAllowed();
+        if (isMediaAllowed) {
+            return;
+        }
+
+        if (!(node instanceof Element)) {
+            return;
+        }
+
+        let mediaBlocked = false;
+
+        switch (node.tagName) {
+            case 'AUDIO':
+            case 'VIDEO':
+            case 'SOURCE':
+            case 'TRACK':
+            case 'EMBED':
+            case 'OBJECT':
+            case 'IMG': {
+                const isExternalUrl = (url) => (url.indexOf('://') > 0 || url.indexOf('//') === 0) && !url.startsWith(window.location.origin);
+                const src = node.getAttribute('src');
+                const data = node.getAttribute('data');
+                const srcset = node.getAttribute('srcset');
+
+                if (srcset) {
+                    const srcsetUrls = srcset.split(',');
+
+                    for (const srcsetUrl of srcsetUrls) {
+                        const [url] = srcsetUrl.trim().split(' ');
+
+                        if (isExternalUrl(url)) {
+                            console.warn('External media blocked', url);
+                            node.remove();
+                            mediaBlocked = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (src && isExternalUrl(src)) {
+                    console.warn('External media blocked', src);
+                    mediaBlocked = true;
+                    node.remove();
+                }
+
+                if (data && isExternalUrl(data)) {
+                    console.warn('External media blocked', data);
+                    mediaBlocked = true;
+                    node.remove();
+                }
+
+                if (mediaBlocked && (node instanceof HTMLMediaElement)) {
+                    node.autoplay = false;
+                    node.pause();
+                }
+            }
+                break;
+        }
+
+        if (mediaBlocked) {
+            const entityId = getCurrentEntityId();
+            const warningShownKey = `mediaWarningShown:${entityId}`;
+
+            if (accountStorage.getItem(warningShownKey) === null) {
+                const warningToast = toastr.warning(
+                    t`Use the 'Ext. Media' button to allow it. Click on this message to dismiss.`,
+                    t`External media has been blocked`,
+                    {
+                        timeOut: 0,
+                        preventDuplicates: true,
+                        onclick: () => toastr.clear(warningToast),
+                    },
+                );
+
+                accountStorage.setItem(warningShownKey, 'true');
+            }
+        }
+    });
+}
+
+export function initChatUtilities() {
     $(document).on('click', '.mes_hide', async function () {
         const messageBlock = $(this).closest('.mes');
         const messageId = Number(messageBlock.attr('mesid'));
@@ -1490,6 +1878,35 @@ jQuery(function () {
         ];
 
         download(chatToSave.map((m) => JSON.stringify(m)).join('\n'), `Assistant - ${humanizedDateTime()}.jsonl`, 'application/json');
+    });
+
+    $(document).on('click', '.assistant_note_import', async function () {
+        const importFile = async () => {
+            const file = fileInput.files[0];
+            if (!file) {
+                return;
+            }
+
+            try {
+                const text = await getFileText(file);
+                const lines = text.split('\n').filter(line => line.trim() !== '');
+                const messages = lines.map(line => JSON.parse(line));
+                const metadata = messages.shift()?.chat_metadata || {};
+                messages.unshift(getSystemMessageByType(system_message_types.ASSISTANT_NOTE));
+                await clearChat();
+                chat.splice(0, chat.length, ...messages);
+                updateChatMetadata(metadata, true);
+                await printMessages();
+            } catch (error) {
+                console.error('Error importing assistant chat:', error);
+                toastr.error(t`It's either corrupted or not a valid JSONL file.`, t`Failed to import chat`);
+            }
+        };
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = '.jsonl';
+        fileInput.addEventListener('change', importFile);
+        fileInput.click();
     });
 
     // Do not change. #attachFile is added by extension.
@@ -1571,7 +1988,8 @@ jQuery(function () {
         await callGenericPopup(wrapper, POPUP_TYPE.TEXT, '', { wide: true, large: true });
     });
 
-    $(document).on('click', 'body.documentstyle .mes .mes_text', function () {
+    $(document).on('click', 'body .mes .mes_text', function () {
+        if (!power_user.click_to_edit) return;
         if (window.getSelection().toString()) return;
         if ($('.edit_textarea').length) return;
         $(this).closest('.mes').find('.mes_edit').trigger('click');
@@ -1603,8 +2021,15 @@ jQuery(function () {
         reloadCurrentChat();
     });
 
-    $(document).on('click', '.mes_img_enlarge', enlargeMessageImage);
+    $('#creators_note_styles_button').on('click', function (e) {
+        e.stopPropagation();
+        openGlobalStylesPreferenceDialog();
+    });
+
+    $(document).on('click', '.mes_img', expandMessageImage);
+    $(document).on('click', '.mes_img_enlarge', expandAndZoomMessageImage);
     $(document).on('click', '.mes_img_delete', deleteMessageImage);
+    $(document).on('click', '.mes_video_delete', deleteMessageVideo);
 
     $('#file_form_input').on('change', async () => {
         const fileInput = document.getElementById('file_form_input');
@@ -1636,4 +2061,6 @@ jQuery(function () {
         fileInput.files = dataTransfer.files;
         await onFileAttach(fileInput.files[0]);
     });
-});
+
+    eventSource.on(event_types.CHAT_CHANGED, checkForCreatorNotesStyles);
+}

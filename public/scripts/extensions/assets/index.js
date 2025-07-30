@@ -7,7 +7,7 @@ import { DOMPurify } from '../../../lib.js';
 import { getRequestHeaders, processDroppedFiles, eventSource, event_types } from '../../../script.js';
 import { deleteExtension, extensionNames, getContext, installExtension, renderExtensionTemplateAsync } from '../../extensions.js';
 import { POPUP_TYPE, Popup, callGenericPopup } from '../../popup.js';
-import { executeSlashCommands } from '../../slash-commands.js';
+import { executeSlashCommandsWithOptions } from '../../slash-commands.js';
 import { accountStorage } from '../../util/AccountStorage.js';
 import { flashHighlight, getStringHash, isValidUrl } from '../../utils.js';
 import { t } from '../../i18n.js';
@@ -53,11 +53,11 @@ function filterAssets() {
 }
 
 const KNOWN_TYPES = {
-    'extension': 'Extensions',
-    'character': 'Characters',
-    'ambient': 'Ambient sounds',
-    'bgm': 'Background music',
-    'blip': 'Blip sounds',
+    'extension': t`Extensions`,
+    'character': t`Characters`,
+    'ambient': t`Ambient sounds`,
+    'bgm': t`Background music`,
+    'blip': t`Blip sounds`,
 };
 
 async function downloadAssetsList(url) {
@@ -142,7 +142,7 @@ async function downloadAssetsList(url) {
                         const assetDelete = async function () {
                             if (assetType === 'character') {
                                 toastr.error('Go to the characters menu to delete a character.', 'Character deletion not supported');
-                                await executeSlashCommands(`/go ${asset['id']}`);
+                                await executeSlashCommandsWithOptions(`/go ${asset['id']}`);
                                 return;
                             }
                             element.off('click');
@@ -291,7 +291,7 @@ async function installAsset(url, assetType, filename) {
     try {
         if (category === 'extension') {
             console.debug(DEBUG_PREFIX, 'Installing extension ', url);
-            await installExtension(url);
+            await installExtension(url, false);
             console.debug(DEBUG_PREFIX, 'Extension installed.');
             return;
         }
@@ -309,7 +309,7 @@ async function installAsset(url, assetType, filename) {
                 console.debug(DEBUG_PREFIX, 'Importing character ', filename);
                 const blob = await result.blob();
                 const file = new File([blob], filename, { type: blob.type });
-                await processDroppedFiles([file], true);
+                await processDroppedFiles([file]);
                 console.debug(DEBUG_PREFIX, 'Character downloaded.');
             }
         }
@@ -424,7 +424,7 @@ jQuery(async () => {
     installHintButton.on('click', async function () {
         const installButton = $('#third_party_extension_button');
         flashHighlight(installButton, 5000);
-        toastr.info('Click the flashing button to install extensions.', 'How to install extensions?');
+        toastr.info(t`Click the flashing button to install extensions.`, t`How to install extensions?`);
     });
 
     const connectButton = windowHtml.find('#assets-connect-button');

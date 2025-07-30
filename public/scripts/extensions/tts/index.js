@@ -1,5 +1,5 @@
 import { cancelTtsPlay, eventSource, event_types, getCurrentChatId, isStreamingEnabled, name2, saveSettingsDebounced, substituteParams } from '../../../script.js';
-import { ModuleWorkerWrapper, doExtrasFetch, extension_settings, getApiUrl, getContext, modules, renderExtensionTemplateAsync } from '../../extensions.js';
+import { ModuleWorkerWrapper, extension_settings, getContext, renderExtensionTemplateAsync } from '../../extensions.js';
 import { delay, escapeRegex, getBase64Async, getStringHash, onlyUnique } from '../../utils.js';
 import { EdgeTtsProvider } from './edge.js';
 import { ElevenLabsTtsProvider } from './elevenlabs.js';
@@ -27,7 +27,11 @@ import { SlashCommandEnumValue, enumTypes } from '../../slash-commands/SlashComm
 import { enumIcons } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
 import { POPUP_TYPE, callGenericPopup } from '../../popup.js';
 import { GoogleTranslateTtsProvider } from './google-translate.js';
+import { GoogleNativeTtsProvider } from './google-native.js';
+import { ChatterboxTtsProvider } from './chatterbox.js';
 import { KokoroTtsProvider } from './kokoro.js';
+import { TtsWebuiProvider } from './tts-webui.js';
+import { PollinationsTtsProvider } from './pollinations.js';
 
 const UPDATE_INTERVAL = 1000;
 const wrapper = new ModuleWorkerWrapper(moduleWorker);
@@ -85,24 +89,53 @@ export function getPreviewString(lang) {
     return previewStrings[lang] ?? fallbackPreview;
 }
 
+/**
+ * Registers a TTS provider.
+ * @param {string} name Name of the TTS provider to register.
+ * @param {function} provider Provider class.
+ */
+export function registerTtsProvider(name, provider) {
+    if (!name || typeof name !== 'string') {
+        throw new Error(`TTS provider name ${name} is not a valid string.`);
+    }
+    if (!provider || typeof provider !== 'function') {
+        throw new Error(`TTS provider ${name} is not a valid provider class.`);
+    }
+    if (ttsProviders[name]) {
+        throw new Error(`TTS provider ${name} is already registered.`);
+    }
+    ttsProviders[name] = provider;
+    console.info(`Registered TTS provider: ${name}`);
+    $('#tts_provider').append($('<option />').val(name).text(name));
+
+    // Load if it was previously selected
+    if (extension_settings.tts.currentProvider === name) {
+        loadTtsProvider(name);
+    }
+}
+
 const ttsProviders = {
     AllTalk: AllTalkTtsProvider,
     Azure: AzureTtsProvider,
+    Chatterbox: ChatterboxTtsProvider,
     Coqui: CoquiTtsProvider,
     'CosyVoice (Unofficial)': CosyVoiceProvider,
     Edge: EdgeTtsProvider,
     ElevenLabs: ElevenLabsTtsProvider,
     'Google Translate': GoogleTranslateTtsProvider,
+    'Google Gemini TTS': GoogleNativeTtsProvider,
     GSVI: GSVITtsProvider,
     'GPT-SoVITS-V2 (Unofficial)': GptSovitsV2Provider,
     Kokoro: KokoroTtsProvider,
     Novel: NovelTtsProvider,
     OpenAI: OpenAITtsProvider,
     'OpenAI Compatible': OpenAICompatibleTtsProvider,
+    Pollinations: PollinationsTtsProvider,
     SBVits2: SBVits2TtsProvider,
     Silero: SileroTtsProvider,
     SpeechT5: SpeechT5TtsProvider,
     System: SystemTtsProvider,
+    'TTS WebUI': TtsWebuiProvider,
     VITS: VITSTtsProvider,
     XTTSv2: XTTSTtsProvider,
 };
@@ -471,6 +504,7 @@ async function processTtsQueue() {
     if (extension_settings.tts.skip_codeblocks) {
         text = text.replace(/^\s{4}.*$/gm, '').trim();
         text = text.replace(/```.*?```/gs, '').trim();
+        text = text.replace(/~~~.*?~~~/gs, '').trim();
     }
 
     if (extension_settings.tts.skip_tags) {
@@ -834,7 +868,7 @@ async function onMessageEvent(messageId, lastCharIndex) {
 
     console.debug(`Adding message from ${message.name} for TTS processing: "${message.mes}"`);
 
-    if (extension_settings.tts.periodic_auto_generation) {
+    if (extension_settings.tts.periodic_auto_generation && isStreamingEnabled()) {
         ttsJobQueue.push(message);
     } else {
         processAndQueueTtsMessage(message);
@@ -1207,8 +1241,8 @@ jQuery(async function () {
     eventSource.on(event_types.GROUP_UPDATED, onChatChanged);
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
-    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onMessageEvent);
-    eventSource.makeLast(event_types.USER_MESSAGE_RENDERED, onMessageEvent);
+    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => onMessageEvent(messageId));
+    eventSource.makeLast(event_types.USER_MESSAGE_RENDERED, (messageId) => onMessageEvent(messageId));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'speak',
         callback: async (args, value) => {

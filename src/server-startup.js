@@ -43,9 +43,9 @@ import { router as openRouterRouter } from './endpoints/openrouter.js';
 import { router as chatCompletionsRouter } from './endpoints/backends/chat-completions.js';
 import { router as koboldRouter } from './endpoints/backends/kobold.js';
 import { router as textCompletionsRouter } from './endpoints/backends/text-completions.js';
-import { router as scaleAltRouter } from './endpoints/backends/scale-alt.js';
 import { router as speechRouter } from './endpoints/speech.js';
 import { router as azureRouter } from './endpoints/azure.js';
+import { router as dataMaidRouter } from './endpoints/data-maid.js';
 
 /**
  * @typedef {object} ServerStartupResult
@@ -170,9 +170,9 @@ export function setupPrivateEndpoints(app) {
     app.use('/api/openrouter', openRouterRouter);
     app.use('/api/backends/kobold', koboldRouter);
     app.use('/api/backends/chat-completions', chatCompletionsRouter);
-    app.use('/api/backends/scale-alt', scaleAltRouter);
     app.use('/api/speech', speechRouter);
     app.use('/api/azure', azureRouter);
+    app.use('/api/data-maid', dataMaidRouter);
 }
 
 /**

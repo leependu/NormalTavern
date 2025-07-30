@@ -1,6 +1,7 @@
 name: 🔀 Pull Request Manager
 
 on:
+  workflow_dispatch: # Allow to manually call this workflow
   pull_request_target:
     types: [opened, synchronize, reopened, edited, labeled, unlabeled, closed]
   pull_request_review_comment:
@@ -11,9 +12,63 @@ permissions:
   pull-requests: write
 
 jobs:
+  run-eslint:
+    name: ✅ Check ESLint on PR
+    runs-on: ubuntu-latest
+    # Only needs to run when code is changed
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+
+    # Override permissions, linter likely needs write access to issues
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        # Checkout
+        # https://github.com/marketplace/actions/checkout
+        uses: actions/checkout@v4.2.2
+        with:
+            ref: ${{ github.event.pull_request.head.sha }}
+            repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+      - name: Setup Node.js
+        # Setup Node.js environment
+        # https://github.com/marketplace/actions/setup-node-js-environment
+        uses: actions/setup-node@v4.3.0
+        with:
+          node-version: 20
+
+      - name: Run npm install
+        run: npm ci
+
+      - name: Run ESLint
+        # Action ESLint
+        # https://github.com/marketplace/actions/action-eslint
+        uses: sibiraj-s/action-eslint@v3.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          eslint-args: '--ignore-path=.gitignore --quiet'
+          extensions: 'js'
+          annotations: true
+          ignore-patterns: |
+            dist/
+            lib/
+
   label-by-size:
     name: 🏷️ Label PR by Size
+    # This job should run after all others, to prevent possible concurrency issues
+    needs: [label-by-branches, label-by-files, remove-stale-label, check-merge-blocking-labels, write-auto-comments]
     runs-on: ubuntu-latest
+    # Only needs to run when code is changed
+    if: always() && (github.event.action == 'opened' || github.event.action == 'synchronize')
+
+    # Override permissions, the labeler needs issues write access
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
 
     steps:
       - name: Label PR Size
@@ -21,7 +76,7 @@ jobs:
         # https://github.com/marketplace/actions/pull-request-size-labeler
         uses: codelytv/pr-size-labeler@v1.10.2
         with:
-          GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           xs_label: '🟩 ⬤○○○○'
           xs_max_size: '20'
           s_label: '🟩 ⬤⬤○○○'
@@ -32,7 +87,6 @@ jobs:
           l_max_size: '1000'
           xl_label: '🟥 ⬤⬤⬤⬤⬤'
           fail_if_xl: 'false'
-          github_api_url: 'https://api.github.com'
           files_to_ignore: |
             "package-lock.json"
             "public/lib/*"
@@ -40,8 +94,8 @@ jobs:
   label-by-branches:
     name: 🏷️ Label PR by Branches
     runs-on: ubuntu-latest
-    # Only label once when PR is created or branches are changed, to allow manual label removal
-    if: github.event.action == 'opened' || (github.event.action == 'synchronize' && (github.event.changes.base || github.event.changes.head))
+    # Only label once when PR is created or when base branch is changed, to allow manual label removal
+    if: github.event.action == 'opened' || (github.event.action == 'synchronize' && github.event.changes.base)
 
     steps:
       - name: Checkout Repository
@@ -55,11 +109,13 @@ jobs:
         uses: actions/labeler@v5.0.0
         with:
           configuration-path: .github/pr-auto-labels-by-branch.yml
-          repo-token: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
   label-by-files:
     name: 🏷️ Label PR by Files
     runs-on: ubuntu-latest
+    # Only needs to run when code is changed
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
 
     steps:
       - name: Checkout Repository
@@ -73,13 +129,19 @@ jobs:
         uses: actions/labeler@v5.0.0
         with:
           configuration-path: .github/pr-auto-labels-by-files.yml
-          repo-token: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
   remove-stale-label:
     name: 🗑️ Remove Stale Label on Comment
     runs-on: ubuntu-latest
-    # Only runs when this is not done by the github actions bot
+    # Only runs on comments not done by the github actions bot
     if: github.event_name == 'pull_request_review_comment' && github.actor != 'github-actions[bot]'
+
+    # Override permissions, issue labeler needs issues write access
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
 
     steps:
       - name: Remove Stale Label
@@ -88,7 +150,7 @@ jobs:
         uses: actions-cool/issues-helper@v3.6.0
         with:
           actions: 'remove-labels'
-          token: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           labels: '⚰️ Stale'
 
@@ -144,7 +206,7 @@ jobs:
 
   write-auto-comments:
     name: 💬 Post PR Comments Based on Labels
-    needs: [label-by-size, label-by-branches, label-by-files]
+    needs: [label-by-branches, label-by-files]
     runs-on: ubuntu-latest
     # Run, even if the previous jobs were skipped/failed
     if: always()
@@ -161,13 +223,19 @@ jobs:
         uses: peaceiris/actions-label-commenter@v1.10.0
         with:
           config_file: .github/pr-auto-comments.yml
-          github_token: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
   # This runs on merged PRs to staging, reading the PR body and directly linked issues. Check `issues-updates-on-merge.yml`:`update-linked-issues` for commit-based updates.
   update-linked-issues:
     name: 🔗 Mark Linked Issues Done on Staging Merge
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'staging'
+
+    # Override permissions, We need to be able to write to issues
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
 
     steps:
       - name: Extract Linked Issues From PR Description
@@ -182,7 +250,7 @@ jobs:
           PR_NUMBER=${{ github.event.pull_request.number }}
           REPO=${{ github.repository }}
           API_URL="https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/issues"
-          ISSUES=$(curl -s -H "Authorization: token ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}" "$API_URL" | jq -r '.[].number' | jq -R -s -c 'split("\n")[:-1]')
+          ISSUES=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$API_URL" | jq -r '.[].number' | jq -R -s -c 'split("\n")[:-1]')
           echo "linked_issues=$ISSUES" >> $GITHUB_ENV
 
       - name: Merge Issue Lists
@@ -194,9 +262,9 @@ jobs:
       - name: Label Linked Issues
         id: label_linked_issues
         env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for ISSUE in $(echo $final_issues | jq -r '.[]'); do
-            gh issue edit $ISSUE -R ${{ github.repository }} --add-label "✅ Done (staging)"
-            echo "Added label '✅ Done (staging)' to issue #$ISSUE"
+            gh issue edit $ISSUE -R ${{ github.repository }} --add-label "✅ Done (staging)" --remove-label "🧑‍💻 In Progress"
+            echo "Added label '✅ Done (staging)' (and removed '🧑‍💻 In Progress' if present) in issue #$ISSUE"
           done
