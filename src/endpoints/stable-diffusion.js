@@ -11,6 +11,7 @@ import _ from 'lodash';
 
 import { delay, getBasicAuthHeader, tryParse } from '../util.js';
 import { readSecret, SECRET_KEYS } from './secrets.js';
+import { AIMLAPI_HEADERS } from '../constants.js';
 
 /**
  * Gets the comfy workflows.
@@ -439,7 +440,7 @@ comfy.post('/models', async (request, response) => {
         models.forEach(it => it.text = it.text.replace(/\.[^.]*$/, '').replace(/_/g, ' '));
 
         return response.send(models);
-    } catch (error)     {
+    } catch (error) {
         console.error(error);
         return response.sendStatus(500);
     }
@@ -580,15 +581,21 @@ comfy.post('/generate', async (request, response) => {
                 .join('\n') || '';
             throw new Error(`ComfyUI generation did not succeed.\n\n${errorMessages}`.trim());
         }
-        const imgInfo = Object.keys(item.outputs).map(it => item.outputs[it].images).flat()[0];
+        const outputs = Object.keys(item.outputs).map(it => item.outputs[it]);
+        console.debug('ComfyUI outputs:', outputs);
+        const imgInfo = outputs.map(it => it.images).flat()[0] ?? outputs.map(it => it.gifs).flat()[0];
+        if (!imgInfo) {
+            throw new Error('ComfyUI did not return any recognizable outputs.');
+        }
         const imgUrl = new URL(urlJoin(request.body.url, '/view'));
         imgUrl.search = `?filename=${imgInfo.filename}&subfolder=${imgInfo.subfolder}&type=${imgInfo.type}`;
         const imgResponse = await fetch(imgUrl);
         if (!imgResponse.ok) {
             throw new Error('ComfyUI returned an error.');
         }
+        const format = path.extname(imgInfo.filename).slice(1).toLowerCase() || 'png';
         const imgBuffer = await imgResponse.arrayBuffer();
-        return response.send(Buffer.from(imgBuffer).toString('base64'));
+        return response.send({ format: format, data: Buffer.from(imgBuffer).toString('base64') });
     } catch (error) {
         console.error('ComfyUI error:', error);
         response.status(500).send(error.message);
@@ -627,8 +634,8 @@ together.post('/models', async (request, response) => {
         }
 
         const models = data
-            .filter(x => x.display_type === 'image')
-            .map(x => ({ value: x.name, text: x.display_name }));
+            .filter(x => x.type === 'image')
+            .map(x => ({ value: x.id, text: x.display_name }));
 
         return response.send(models);
     } catch (error) {
@@ -819,13 +826,16 @@ pollinations.post('/generate', async (request, response) => {
             model: String(request.body.model),
             negative_prompt: String(request.body.negative_prompt),
             seed: String(request.body.seed >= 0 ? request.body.seed : Math.floor(Math.random() * 10_000_000)),
-            enhance: String(request.body.enhance ?? false),
             width: String(request.body.width ?? 1024),
             height: String(request.body.height ?? 1024),
             nologo: String(true),
             nofeed: String(true),
-            referer: 'sillytavern',
+            private: String(true),
+            referrer: 'sillytavern',
         });
+        if (request.body.enhance) {
+            params.set('enhance', String(true));
+        }
         promptUrl.search = params.toString();
 
         console.info('Pollinations request URL:', promptUrl.toString());
@@ -833,7 +843,8 @@ pollinations.post('/generate', async (request, response) => {
         const result = await fetch(promptUrl);
 
         if (!result.ok) {
-            console.warn('Pollinations returned an error.', result.status, result.statusText);
+            const text = await result.text();
+            console.warn('Pollinations returned an error.', text);
             throw new Error('Pollinations request failed.');
         }
 
@@ -906,89 +917,6 @@ stability.post('/generate', async (request, response) => {
         return response.sendStatus(500);
     }
 });
-
-const blockentropy = express.Router();
-
-blockentropy.post('/models', async (request, response) => {
-    try {
-        const key = readSecret(request.user.directories, SECRET_KEYS.BLOCKENTROPY);
-
-        if (!key) {
-            console.warn('Block Entropy key not found.');
-            return response.sendStatus(400);
-        }
-
-        const modelsResponse = await fetch('https://api.blockentropy.ai/sdapi/v1/sd-models', {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${key}`,
-            },
-        });
-
-        if (!modelsResponse.ok) {
-            console.warn('Block Entropy returned an error.');
-            return response.sendStatus(500);
-        }
-
-        const data = await modelsResponse.json();
-
-        if (!Array.isArray(data)) {
-            console.warn('Block Entropy returned invalid data.');
-            return response.sendStatus(500);
-        }
-        const models = data.map(x => ({ value: x.name, text: x.name }));
-        return response.send(models);
-
-    } catch (error) {
-        console.error(error);
-        return response.sendStatus(500);
-    }
-});
-
-blockentropy.post('/generate', async (request, response) => {
-    try {
-        const key = readSecret(request.user.directories, SECRET_KEYS.BLOCKENTROPY);
-
-        if (!key) {
-            console.warn('Block Entropy key not found.');
-            return response.sendStatus(400);
-        }
-
-        console.debug('Block Entropy request:', request.body);
-
-        const result = await fetch('https://api.blockentropy.ai/sdapi/v1/txt2img', {
-            method: 'POST',
-            body: JSON.stringify({
-                prompt: request.body.prompt,
-                negative_prompt: request.body.negative_prompt,
-                model: request.body.model,
-                steps: request.body.steps,
-                width: request.body.width,
-                height: request.body.height,
-                // Random seed if negative.
-                seed: request.body.seed >= 0 ? request.body.seed : Math.floor(Math.random() * 10_000_000),
-            }),
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${key}`,
-            },
-        });
-
-        if (!result.ok) {
-            console.warn('Block Entropy returned an error.');
-            return response.sendStatus(500);
-        }
-
-        const data = await result.json();
-        console.debug('Block Entropy response:', data);
-
-        return response.send(data);
-    } catch (error) {
-        console.error(error);
-        return response.sendStatus(500);
-    }
-});
-
 
 const huggingface = express.Router();
 
@@ -1232,27 +1160,44 @@ const falai = express.Router();
 falai.post('/models', async (_request, response) => {
     try {
         const modelsUrl = new URL('https://fal.ai/api/models?categories=text-to-image');
-        const result = await fetch(modelsUrl);
+        let page = 1;
+        /** @type {any} */
+        let modelsResponse;
+        let models = [];
 
-        if (!result.ok) {
-            console.warn('FAL.AI returned an error.', result.status, result.statusText);
-            throw new Error('FAL.AI request failed.');
-        }
+        do {
+            modelsUrl.searchParams.set('page', page.toString());
+            const result = await fetch(modelsUrl);
 
-        const data = await result.json();
+            if (!result.ok) {
+                console.warn('FAL.AI returned an error.', result.status, result.statusText);
+                throw new Error('FAL.AI request failed.');
+            }
 
-        if (!Array.isArray(data)) {
-            console.warn('FAL.AI returned invalid data.');
-            throw new Error('FAL.AI request failed.');
-        }
+            modelsResponse = await result.json();
+            if (!('items' in modelsResponse) || !Array.isArray(modelsResponse.items)) {
+                console.warn('FAL.AI returned invalid data.');
+                throw new Error('FAL.AI request failed.');
+            }
 
-        const models = data
-            .filter(x => !x.title.toLowerCase().includes('inpainting') &&
-                !x.title.toLowerCase().includes('control') &&
-                !x.title.toLowerCase().includes('upscale'))
+            models = models.concat(
+                modelsResponse.items.filter(
+                    x => (
+                        !x.title.toLowerCase().includes('inpainting') &&
+                        !x.title.toLowerCase().includes('control') &&
+                        !x.title.toLowerCase().includes('upscale') &&
+                        !x.title.toLowerCase().includes('lora')
+                    ),
+                ),
+            );
+
+            page = modelsResponse.page + 1;
+        } while (modelsResponse != null && page < modelsResponse.pages);
+
+        const modelOptions = models
             .sort((a, b) => a.title.localeCompare(b.title))
             .map(x => ({ value: x.modelUrl.split('fal-ai/')[1], text: x.title }));
-        return response.send(models);
+        return response.send(modelOptions);
     } catch (error) {
         console.error(error);
         return response.sendStatus(500);
@@ -1328,6 +1273,7 @@ falai.post('/generate', async (request, response) => {
                         'Authorization': `Key ${key}`,
                     },
                 });
+                /** @type {any} */
                 const resultData = await resultFetch.json();
 
                 if (resultData.detail !== null && resultData.detail !== undefined) {
@@ -1353,13 +1299,148 @@ falai.post('/generate', async (request, response) => {
     }
 });
 
+const xai = express.Router();
+
+xai.post('/generate', async (request, response) => {
+    try {
+        const key = readSecret(request.user.directories, SECRET_KEYS.XAI);
+
+        if (!key) {
+            console.warn('xAI key not found.');
+            return response.sendStatus(400);
+        }
+
+        const requestBody = {
+            prompt: request.body.prompt,
+            model: request.body.model,
+            response_format: 'b64_json',
+        };
+
+        console.debug('xAI request:', requestBody);
+
+        const result = await fetch('https://api.x.ai/v1/images/generations', {
+            method: 'POST',
+            body: JSON.stringify(requestBody),
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`,
+            },
+        });
+
+        if (!result.ok) {
+            const text = await result.text();
+            console.warn('xAI returned an error.', text);
+            return response.sendStatus(500);
+        }
+
+        /** @type {any} */
+        const data = await result.json();
+
+        const image = data?.data?.[0]?.b64_json;
+        if (!image) {
+            console.warn('xAI returned invalid data.');
+            return response.sendStatus(500);
+        }
+
+        return response.send({ image });
+    } catch (error) {
+        console.error('Error communicating with xAI', error);
+        return response.sendStatus(500);
+    }
+});
+
+const aimlapi = express.Router();
+
+aimlapi.post('/models', async (request, response) => {
+    try {
+        const key = readSecret(request.user.directories, SECRET_KEYS.AIMLAPI);
+
+        if (!key) {
+            console.warn('AI/ML API key not found.');
+            return response.sendStatus(400);
+        }
+
+        const modelsResponse = await fetch('https://api.aimlapi.com/v1/models', {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${key}`,
+            },
+        });
+
+        if (!modelsResponse.ok) {
+            console.warn('AI/ML API returned an error.');
+            return response.sendStatus(500);
+        }
+
+        /** @type {any} */
+        const data = await modelsResponse.json();
+        const models = (data.data || [])
+            .filter(model =>
+                model.type === 'image' &&
+                model.id !== 'triposr' &&
+                model.id !== 'flux/dev/image-to-image',
+            )
+            .map(model => ({
+                value: model.id,
+                text: model.info?.name || model.id,
+            }));
+
+        return response.send({ data: models });
+    } catch (error) {
+        console.error(error);
+        return response.sendStatus(500);
+    }
+});
+
+aimlapi.post('/generate-image', async (req, res) => {
+    try {
+        const key = readSecret(req.user.directories, SECRET_KEYS.AIMLAPI);
+        if (!key) return res.sendStatus(400);
+
+        console.debug('AI/ML API image request:', req.body);
+
+        const apiRes = await fetch('https://api.aimlapi.com/v1/images/generations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, ...AIMLAPI_HEADERS },
+            body: JSON.stringify(req.body),
+        });
+        if (!apiRes.ok) {
+            const err = await apiRes.text();
+            return res.status(500).send(err);
+        }
+        /** @type {any} */
+        const data = await apiRes.json();
+
+        const imgObj = Array.isArray(data.images) ? data.images[0] : data.data?.[0];
+        if (!imgObj) return res.status(500).send('No image returned');
+
+        let base64;
+        if (imgObj.b64_json || imgObj.base64) {
+            base64 = imgObj.b64_json || imgObj.base64;
+        } else if (imgObj.url) {
+            const blobRes = await fetch(imgObj.url);
+            if (!blobRes.ok) throw new Error('Failed to fetch image URL');
+            const buffer = await blobRes.arrayBuffer();
+            base64 = Buffer.from(buffer).toString('base64');
+        } else {
+            throw new Error('Unsupported image format');
+        }
+
+        return res.json({ format: 'png', data: base64 });
+    } catch (e) {
+        console.error(e);
+        res.status(500).send('Internal error');
+    }
+});
+
 router.use('/comfy', comfy);
 router.use('/together', together);
 router.use('/drawthings', drawthings);
 router.use('/pollinations', pollinations);
 router.use('/stability', stability);
-router.use('/blockentropy', blockentropy);
 router.use('/huggingface', huggingface);
 router.use('/nanogpt', nanogpt);
 router.use('/bfl', bfl);
 router.use('/falai', falai);
+router.use('/xai', xai);
+router.use('/aimlapi', aimlapi);

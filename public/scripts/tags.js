@@ -13,7 +13,6 @@ import {
     DEFAULT_PRINT_TIMEOUT,
     printCharacters,
 } from '../script.js';
-// eslint-disable-next-line no-unused-vars
 import { FILTER_TYPES, FILTER_STATES, DEFAULT_FILTER_STATE, isFilterState, FilterHelper } from './filters.js';
 
 import { groupCandidatesFilter, groups, selected_group } from './group-chats.js';
@@ -28,7 +27,7 @@ import { debounce_timeout } from './constants.js';
 import { INTERACTABLE_CONTROL_CLASS } from './keyboard.js';
 import { commonEnumProviders } from './slash-commands/SlashCommandCommonEnumsProvider.js';
 import { renderTemplateAsync } from './templates.js';
-import { t } from './i18n.js';
+import { t, translate } from './i18n.js';
 
 export {
     TAG_FOLDER_TYPES,
@@ -137,6 +136,7 @@ const TAG_FOLDER_DEFAULT_TYPE = 'NONE';
  * @property {string} [color] - The background color of the tag
  * @property {string} [color2] - The foreground color of the tag
  * @property {number} [create_date] - A number representing the date when this tag was created
+ * @property {boolean} [is_hidden_on_character_card] - Whether this tag is hidden on the character card
  *
  * @property {function} [action] - An optional function that gets executed when this tag is an actionable tag and is clicked on.
  * @property {string} [class] - An optional css class added to the control representing this tag when printed. Used for custom tags in the filters.
@@ -319,7 +319,7 @@ function getTagBlock(tag, entities, hidden = 0, isUseless = false) {
     template.find('.avatar').css({ 'background-color': tag.color, 'color': tag.color2 }).attr('title', `[Folder] ${tag.name}`);
     template.find('.ch_name').text(tag.name).attr('title', `[Folder] ${tag.name}`);
     template.find('.bogus_folder_hidden_counter').text(hidden > 0 ? `${hidden} hidden` : '');
-    template.find('.bogus_folder_counter').text(`${count} ${count != 1 ? 'characters' : 'character'}`);
+    template.find('.bogus_folder_counter').text(`${count} ` + (count != 1 ? t`characters` : t`character`));
     template.find('.bogus_folder_icon').addClass(tagFolder.fa_icon);
     if (isUseless) template.addClass('useless');
 
@@ -686,6 +686,8 @@ function selectTag(event, ui, listSelector, { tagListOptions = {} } = {}) {
 
     addTagsToEntity(tag, characterIds, { tagListSelector: listSelector, tagListOptions: tagListOptions });
 
+    applyCharacterTagsToMessageDivs();
+
     // need to return false to keep the input clear
     return false;
 }
@@ -896,6 +898,7 @@ function newTag(tagName) {
         folder_type: TAG_FOLDER_DEFAULT_TYPE,
         filter_state: DEFAULT_FILTER_STATE,
         sort_order: Math.max(0, ...tags.map(t => t.sort_order)) + 1,
+        is_hidden_on_character_card: false,
         color: '',
         color2: '',
         create_date: Date.now(),
@@ -910,12 +913,13 @@ function newTag(tagName) {
  * @property {(tag: Tag)=>boolean} [removeAction=undefined] - Action to perform on tag removal instead of the default remove action. If the action returns false, the tag will not be removed.
  * @property {boolean} [isGeneralList=false] - If true, indicates that this is the general list of tags.
  * @property {boolean} [skipExistsCheck=false] - If true, the tag gets added even if a tag with the same id already exists.
+ * @property {boolean} [isCharacterList=false] - If true, indicates that this is the character's list of tags.
  */
 
 /**
  * @typedef {object} PrintTagListOptions - Optional parameters for printing the tag list.
  * @property {Tag[]|function(): Tag[]} [tags=undefined] - Optional override of tags that should be printed. Those will not be sorted. If no supplied, tags for the relevant character are printed. Can also be a function that returns the tags.
- * @property {Tag|Tag[]} [addTag=undefined] - Optionally provide one or multiple tags that should be manually added to this print. Either to the overriden tag list or the found tags based on the entity/key. Will respect the tag exists check.
+ * @property {Tag|Tag[]} [addTag=undefined] - Optionally provide one or multiple tags that should be manually added to this print. Either to the overridden tag list or the found tags based on the entity/key. Will respect the tag exists check.
  * @property {object|number|string} [forEntityOrKey=undefined] - Optional override for the chosen entity, otherwise the currently selected is chosen. Can be an entity with id property (character, group, tag), or directly an id or tag key.
  * @property {boolean|string} [empty=true] - Whether the list should be initially empty. If a string string is provided, 'always' will always empty the list, otherwise it'll evaluate to a boolean.
  * @property {boolean} [sort=true] - Whether the tags should be sorted via the sort function, or kept as is.
@@ -934,6 +938,10 @@ function printTagList(element, { tags = undefined, addTag = undefined, forEntity
     const $element = (typeof element === 'string') ? $(element) : element;
     const key = forEntityOrKey !== undefined ? getTagKeyForEntity(forEntityOrKey) : getTagKey();
     let printableTags = tags ? (typeof tags === 'function' ? tags() : tags) : getTagsList(key, sort);
+
+    if (tagOptions.isCharacterList) {
+        printableTags = printableTags.filter(tag => !tag.is_hidden_on_character_card);
+    }
 
     if (empty === 'always' || (empty && (printableTags?.length > 0 || key))) {
         $element.empty();
@@ -1058,7 +1066,7 @@ function appendTagToList(listElement, tag, { removable = false, isFilter = false
         tagElement.attr('title', tag.title);
     }
     if (tag.icon) {
-        tagElement.find('.tag_name').text('').attr('title', `${tag.name} ${tag.title || ''}`.trim()).addClass(tag.icon);
+        tagElement.find('.tag_name').text('').attr('title', `${translate(tag.name)} ${tag.title || ''}`.trim()).addClass(tag.icon);
         tagElement.addClass('actionable');
     }
 
@@ -1231,6 +1239,8 @@ function onTagRemoveClick(event) {
     const characterIds = characterData ? JSON.parse(characterData).characterIds : null;
 
     removeTagFromEntity(tag, characterIds, { tagElement: tagElement });
+
+    applyCharacterTagsToMessageDivs();
 }
 
 // @ts-ignore
@@ -1295,7 +1305,7 @@ export function createTagInput(inputSelector, listSelector, tagListOptions = {})
             select: (e, u) => selectTag(e, u, listSelector, { tagListOptions: tagListOptions }),
             minLength: 0,
         })
-        .focus(onTagInputFocus); // <== show tag list on click
+        .on('focus', onTagInputFocus); // <== show tag list on click
 }
 
 async function onViewTagsListClick() {
@@ -1309,7 +1319,7 @@ async function onViewTagsListClick() {
     printViewTagList(tagContainer);
     makeTagListDraggable(tagContainer);
 
-    await callGenericPopup(html, POPUP_TYPE.TEXT, null, { allowVerticalScrolling: true });
+    await callGenericPopup(html, POPUP_TYPE.TEXT, null, { allowVerticalScrolling: true, wide: true, large: true });
 }
 
 /**
@@ -1595,6 +1605,21 @@ function appendViewTagToList(list, tag, everything) {
         colorPicker[0].color = defaultColor;
     });
 
+    const getHideTooltip = () => tag.is_hidden_on_character_card ? t`Hide on character card` : t`Show on character card`;
+    const hideToggle = template.find('.eye-toggle');
+    hideToggle.toggleClass('fa-eye-slash', tag.is_hidden_on_character_card);
+    hideToggle.toggleClass('fa-eye', !tag.is_hidden_on_character_card);
+    hideToggle.attr('title', getHideTooltip());
+
+    hideToggle.on('click', () => {
+        tag.is_hidden_on_character_card = !tag.is_hidden_on_character_card;
+        hideToggle.toggleClass('fa-eye-slash', tag.is_hidden_on_character_card);
+        hideToggle.toggleClass('fa-eye', !tag.is_hidden_on_character_card);
+        hideToggle.attr('title', getHideTooltip());
+        printCharactersDebounced();
+        saveSettingsDebounced();
+    });
+
     list.append(template);
 
     // We prevent the popup from auto-close on Escape press on the color pickups. If the user really wants to, he can hit it again
@@ -1645,6 +1670,7 @@ function updateDrawTagFolder(element, tag) {
 
     // Draw/update css attributes for this class
     folderElement.attr('title', tagFolder.tooltip);
+    folderElement.attr('data-i18n', '[title]' + tagFolder.tooltip);
     const indicator = folderElement.find('.tag_folder_indicator');
     indicator.text(tagFolder.icon);
     indicator.css('color', tagFolder.color);
@@ -1656,14 +1682,7 @@ async function onTagDeleteClick() {
     const tag = tags.find(x => x.id === id);
     const otherTags = sortTags(tags.filter(x => x.id !== id).map(x => ({ id: x.id, name: x.name })));
 
-    const popupContent = $(`
-        <h3>Delete Tag</h3>
-        <div>Do you want to delete the tag <div id="tag_to_delete" class="tags_inline inline-flex margin-r2"></div>?</div>
-        <div class="m-t-2 marginBot5">If you want to merge all references to this tag into another tag, select it below:</div>
-        <select id="merge_tag_select">
-            <option value="">--- None ---</option>
-            ${otherTags.map(x => `<option value="${x.id}">${x.name}</option>`).join('')}
-        </select>`);
+    const popupContent = $(await renderTemplateAsync('deleteTag', { otherTags }));
 
     appendTagToList(popupContent.find('#tag_to_delete'), tag);
 
@@ -1703,6 +1722,8 @@ async function onTagDeleteClick() {
 
     printCharactersDebounced();
     saveSettingsDebounced();
+
+    applyCharacterTagsToMessageDivs();
 }
 
 function onTagRenameInput() {
@@ -1713,6 +1734,8 @@ function onTagRenameInput() {
     $(this).attr('dirty', '');
     $(`.tag[id="${id}"] .tag_name`).text(newName);
     saveSettingsDebounced();
+
+    applyCharacterTagsToMessageDivs();
 }
 
 /**
@@ -1723,7 +1746,6 @@ function onTagRenameInput() {
  * @param {string} cssProperty - The CSS property to apply the color to
  */
 function onTagColorize(evt, setColor, cssProperty) {
-    console.debug(evt);
     const isDefaultColor = $(evt.target).data('default-color') === evt.detail.rgba;
     $(evt.target).closest('.tag_view_color_picker').find('.link_icon').toggle(!isDefaultColor);
 
@@ -1734,7 +1756,6 @@ function onTagColorize(evt, setColor, cssProperty) {
     $(evt.target).closest('.tag_view_item').find('.tag_view_name').css(cssProperty, newColor);
     const tag = tags.find(x => x.id === id);
     setColor(tag, newColor);
-    console.debug(tag);
     saveSettingsDebounced();
 
     // Debounce redrawing color of the tag in other elements
@@ -1840,7 +1861,8 @@ function registerTagsSlashCommands() {
             }),
         ],
         unnamedArgumentList: [
-            SlashCommandArgument.fromProps({ description: 'tag name',
+            SlashCommandArgument.fromProps({
+                description: 'tag name',
                 typeList: [ARGUMENT_TYPE.STRING],
                 isRequired: true,
                 enumProvider: commonEnumProviders.tagsForChar('not-existing'),
@@ -1877,7 +1899,8 @@ function registerTagsSlashCommands() {
             return String(result);
         },
         namedArgumentList: [
-            SlashCommandNamedArgument.fromProps({ name: 'name',
+            SlashCommandNamedArgument.fromProps({
+                name: 'name',
                 description: 'Character name - or unique character identifier (avatar key)',
                 typeList: [ARGUMENT_TYPE.STRING],
                 defaultValue: '{{char}}',
@@ -1885,7 +1908,8 @@ function registerTagsSlashCommands() {
             }),
         ],
         unnamedArgumentList: [
-            SlashCommandArgument.fromProps({ description: 'tag name',
+            SlashCommandArgument.fromProps({
+                description: 'tag name',
                 typeList: [ARGUMENT_TYPE.STRING],
                 isRequired: true,
                 /**@param {SlashCommandExecutor} executor */
@@ -1989,6 +2013,171 @@ function registerTagsSlashCommands() {
     }));
 }
 
+/**
+ * Function to apply character tags to message divs when rendering the chat
+ * @param {object} options Options for applying character tags
+ * @param {number|number[]} [options.mesIds=[]] An id or array of message IDs to filter by.
+ * If empty, all messages will be processed.
+ * @returns {void}
+ * @description This function iterates through the chat messages and applies character tags
+ */
+export function applyCharacterTagsToMessageDivs({ mesIds = [] } = {}) {
+    try {
+        const messagesFilter = buildMessagesFilter(mesIds);
+        const messages = $('#chat').children(messagesFilter);
+
+        // Clear existing tags
+        messages.each(function () {
+            const element = this; // Get the raw DOM element
+
+            for (const attr of [...element.attributes]) {
+                if (attr.name.startsWith('data-char-tag-') || attr.name === 'data-char-tags') {
+                    element.removeAttribute(attr.name);
+                }
+            }
+        });
+
+        const tagsList = tags, characterTagData = tag_map;
+
+        if (!tagsList?.length || !characterTagData) {
+            return;
+        }
+
+        const tagNamesById = tagsList.reduce((acc, tag) => {
+            acc[tag.id] = tag.name;
+            return acc;
+        }, {});
+
+        const characterTagsCache = new Map();
+
+        // Iterate each message div
+        messages.each(function () {
+            const $this = $(this); // Store the jQuery object
+            const avatarFileName = extractCharacterAvatar($this.find('.avatar img').attr('src'));
+
+            if (!avatarFileName) {
+                return;
+            }
+
+            let tagsForCharacter = characterTagsCache.get(avatarFileName);
+
+            // If tags are NOT in the cache, compute and store them
+            if (!tagsForCharacter) {
+                const tagIds = characterTagData[avatarFileName];
+                if (tagIds?.length) {
+                    const tagNames = tagIds
+                        .map(id => tagNamesById[id])
+                        .filter(Boolean);
+
+                    if (tagNames.length) {
+                        tagsForCharacter = {
+                            tagNames,
+                            joinedTagNames: tagNames
+                                .map(name => name?.replace(/,/g, ' ')) // replace commas with spaces to avoid issues with tag names containing commas
+                                .join(','),
+                        };
+                        // Add the newly computed tags to the cache
+                        characterTagsCache.set(avatarFileName, tagsForCharacter);
+                    }
+                }
+            }
+
+            // If we have tags (either from cache or newly computed), apply them
+            if (tagsForCharacter) {
+                applyTags($this, tagsForCharacter);
+            }
+        });
+    } catch (error) {
+        console.error('Error applying character tags to message divs:', error);
+    }
+}
+
+/**
+ * Builds a jQuery selector string to filter messages by their IDs.
+ * @param {number|number[]} mesIds - An id or array of message IDs to filter by.
+ * @returns {string} A jQuery selector string that matches messages with the specified IDs.
+ * If mesIds is empty, it returns '.mes' to select all messages.
+ * @example
+ * buildMessagesFilter([1, 5]); // Returns '.mes[mesid="1"],.mes[mesid="5"]'
+ * buildMessagesFilter([]); // Returns '.mes'
+ */
+function buildMessagesFilter(mesIds) {
+    const allMessages = '.mes';
+
+    if (!mesIds) {
+        return allMessages; // If no mesIds provided, select all messages
+    }
+
+    const mesIdsArray = Array.isArray(mesIds) ? mesIds : [mesIds];
+
+    if (mesIdsArray?.length) {
+        // Create a valid jQuery selector for multiple attribute values.
+        // Example output: '.mes[mesid="1"],.mes[mesid="5"]'
+        return mesIdsArray.map(id => `.mes[mesid="${id}"]`).join(',');
+    }
+
+    // If mesIds is empty, select all messages.
+    return allMessages;
+}
+
+/**
+ * Helper function to apply all necessary data attributes to a DOM element.
+ * @param {JQuery<HTMLElement>} $element - The jQuery object for the message div.
+ * @param {object} tagData - An object containing tag information.
+ * @param {string[]} tagData.tagNames - An array of tag names.
+ * @param {string} tagData.joinedTagNames - A comma-separated string of tag names.
+ */
+function applyTags($element, tagData) {
+    $element.attr('data-char-tags', tagData.joinedTagNames);
+    tagData.tagNames.forEach(tagName => {
+        const normalizedTagName = normalizeTagName(tagName);
+
+        if (!normalizedTagName) {
+            return; // Skip empty tag names
+        }
+
+        $element.attr(`data-char-tag-${normalizedTagName}`, '');
+    });
+}
+
+/**
+ * Normalizes a tag name by trimming, converting spaces to hyphens, replacing accented characters,
+ * removing special characters, and converting to lowercase.
+ * @param {string} name The tag name to normalize.
+ * @returns {string} The normalized tag name.
+ */
+function normalizeTagName(name) {
+    if (!name?.trim()) {
+        return '';
+    }
+
+    // Normalize the tag name by trimming, converting spaces to hyphens, replacing accented characters, removing special characters, and converting to lowercase
+    return name.trim()
+        .normalize('NFD') // Normalize accented characters
+        .replace(/[\u0300-\u036f]/g, '') // Remove diacritical marks
+        .replace(/[^a-zA-Z0-9\s_-]/g, '') // Remove special characters except spaces, underscores, and hyphens
+        .replace(/[\s_]+/g, '-') // Replace spaces and underscores with hyphens
+        .toLowerCase();
+}
+
+/** Extracts the character avatar file name from the avatar source URL.
+ * @param {string} avatarSrc The source URL of the character avatar.
+ * @returns {string|null} The normalized avatar file name, or null if the input is falsy or doesn't contain a valid file name.
+ */
+function extractCharacterAvatar(avatarSrc) {
+    if (!avatarSrc) {
+        return null;
+    }
+
+    try {
+        const url = new URL(avatarSrc, window.location.origin);
+        return url?.searchParams.get('file');
+    } catch (error) {
+        console.error('Unable to parse character avatar using avatarSrc', avatarSrc, error);
+        return null;
+    }
+}
+
 export function initTags() {
     createTagInput('#tagInput', '#tagList', { tagOptions: { removable: true } });
     createTagInput('#groupTagInput', '#groupTagList', { tagOptions: { removable: true } });
@@ -1997,7 +2186,12 @@ export function initTags() {
     $(document).on('click', '#rm_button_group_chats', onGroupCreateClick);
     $(document).on('click', '.tag_remove', onTagRemoveClick);
     $(document).on('input', '.tag_input', onTagInput);
-    $(document).on('click', '.tags_view', onViewTagsListClick);
+    $(document).on('click', '.tags_view', function (event) {
+        // 1. Prevent the label from toggling the checkbox
+        event.preventDefault();
+        // 2. Open the tag view list dialog
+        onViewTagsListClick();
+    });
     $(document).on('click', '.tag_delete', onTagDeleteClick);
     $(document).on('click', '.tag_as_folder', onTagAsFolderClick);
     $(document).on('input', '.tag_view_name', onTagRenameInput);

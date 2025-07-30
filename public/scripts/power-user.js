@@ -25,6 +25,8 @@ import {
     setActiveCharacter,
     entitiesFilter,
     doNewChat,
+    online_status,
+    messageFormatting,
 } from '../script.js';
 import { isMobile, initMovingUI, favsToHotswap } from './RossAscends-mods.js';
 import {
@@ -36,6 +38,7 @@ import {
     loadInstructMode,
     names_behavior_types,
     selectInstructPreset,
+    updateBindModelTemplatesState,
 } from './instruct-mode.js';
 
 import { getTagsList, tag_import_setting, tag_map, tags } from './tags.js';
@@ -43,35 +46,34 @@ import { tokenizers } from './tokenizers.js';
 import { BIAS_CACHE } from './logit-bias.js';
 import { renderTemplateAsync } from './templates.js';
 
-import { countOccurrences, debounce, delay, download, getFileText, getStringHash, isOdd, isTrueBoolean, onlyUnique, resetScrollHeight, shuffle, sortMoments, stringToRange, timestampToMoment } from './utils.js';
+import { countOccurrences, debounce, delay, download, getFileText, getSanitizedFilename, getStringHash, isOdd, isTrueBoolean, onlyUnique, resetScrollHeight, shuffle, sortMoments, stringToRange, timestampToMoment } from './utils.js';
 import { FILTER_TYPES } from './filters.js';
 import { PARSER_FLAG, SlashCommandParser } from './slash-commands/SlashCommandParser.js';
 import { SlashCommand } from './slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from './slash-commands/SlashCommandArgument.js';
-import { AUTOCOMPLETE_SELECT_KEY, AUTOCOMPLETE_WIDTH } from './autocomplete/AutoComplete.js';
+import { AUTOCOMPLETE_SELECT_KEY, AUTOCOMPLETE_STATE, AUTOCOMPLETE_WIDTH } from './autocomplete/AutoComplete.js';
 import { SlashCommandEnumValue, enumTypes } from './slash-commands/SlashCommandEnumValue.js';
 import { commonEnumProviders, enumIcons } from './slash-commands/SlashCommandCommonEnumsProvider.js';
-import { POPUP_TYPE, callGenericPopup } from './popup.js';
+import { POPUP_TYPE, callGenericPopup, fixToastrForDialogs } from './popup.js';
 import { loadSystemPrompts } from './sysprompt.js';
 import { fuzzySearchCategories } from './filters.js';
 import { accountStorage } from './util/AccountStorage.js';
+import { DEFAULT_REASONING_TEMPLATE, loadReasoningTemplates } from './reasoning.js';
+import { bindModelTemplates } from './chat-templates.js';
 
-export {
-    loadPowerUserSettings,
-    loadMovingUIState,
-    collapseNewlines,
-    playMessageSound,
-    fixMarkdown,
-    power_user,
-    send_on_enter_options,
-    getContextSettings,
-    applyPowerUserSettings,
-};
+export const toastPositionClasses = [
+    'toast-top-left',
+    'toast-top-center',
+    'toast-top-right',
+    'toast-bottom-left',
+    'toast-bottom-center',
+    'toast-bottom-right',
+];
 
 export const MAX_CONTEXT_DEFAULT = 8192;
 export const MAX_RESPONSE_DEFAULT = 2048;
-const MAX_CONTEXT_UNLOCKED = 200 * 1024;
-const MAX_RESPONSE_UNLOCKED = 32 * 1024;
+const MAX_CONTEXT_UNLOCKED = 512 * 1024;
+const MAX_RESPONSE_UNLOCKED = 64 * 1024;
 const unlockedMaxContextStep = 512;
 const maxContextMin = 512;
 const maxContextStep = 64;
@@ -79,11 +81,13 @@ const maxContextStep = 64;
 const defaultStoryString = '{{#if system}}{{system}}\n{{/if}}{{#if description}}{{description}}\n{{/if}}{{#if personality}}{{char}}\'s personality: {{personality}}\n{{/if}}{{#if scenario}}Scenario: {{scenario}}\n{{/if}}{{#if persona}}{{persona}}\n{{/if}}';
 const defaultExampleSeparator = '***';
 const defaultChatStart = '***';
+const defaultToastPosition = 'toast-top-center';
 
 const avatar_styles = {
     ROUND: 0,
     RECTANGULAR: 1,
     SQUARE: 2,
+    ROUNDED: 3,
 };
 
 export const chat_styles = {
@@ -92,7 +96,7 @@ export const chat_styles = {
     DOCUMENT: 2,
 };
 
-const send_on_enter_options = {
+export const send_on_enter_options = {
     DISABLED: -1,
     AUTO: 0,
     ENABLED: 1,
@@ -110,7 +114,7 @@ export const persona_description_positions = {
     NONE: 9,
 };
 
-let power_user = {
+export const power_user = {
     charListGrid: false,
     tokenizer: tokenizers.BEST_MATCH,
     token_padding: 64,
@@ -135,6 +139,7 @@ let power_user = {
     fast_ui_mode: true,
     avatar_style: avatar_styles.ROUND,
     chat_display: chat_styles.DEFAULT,
+    toastr_position: defaultToastPosition,
     chat_width: 50,
     never_resize_avatars: false,
     show_card_avatar_urls: false,
@@ -218,7 +223,9 @@ let power_user = {
         system_sequence: '',
         system_suffix: '',
         last_system_sequence: '',
+        first_input_sequence: '',
         first_output_sequence: '',
+        last_input_sequence: '',
         last_output_sequence: '',
         system_sequence_prefix: '',
         system_sequence_suffix: '',
@@ -227,7 +234,6 @@ let power_user = {
         macro: true,
         names_behavior: names_behavior_types.FORCE,
         activation_regex: '',
-        derived: false,
         bind_to_context: false,
         user_alignment_message: '',
         system_same_as_user: false,
@@ -241,20 +247,26 @@ let power_user = {
         chat_start: defaultChatStart,
         example_separator: defaultExampleSeparator,
         use_stop_strings: true,
-        allow_jailbreak: false,
         names_as_stop_strings: true,
     },
 
+    instruct_derived: false,
     context_derived: false,
     context_size_derived: false,
+    /** User-defined model identifier / chat template hash to instruct/context template mappings */
+    model_templates_mappings: {},
+    /** The chat template hash of the currently loaded model, if any; used when deriving mappings */
+    chat_template_hash: '',
 
     sysprompt: {
         enabled: true,
         name: 'Neutral - Chat',
         content: 'Write {{char}}\'s next reply in a fictional chat between {{char}} and {{user}}.',
+        post_history: '',
     },
 
     reasoning: {
+        name: DEFAULT_REASONING_TEMPLATE,
         auto_parse: false,
         add_to_prompts: false,
         auto_expand: false,
@@ -289,6 +301,7 @@ let power_user = {
     stscript: {
         matching: 'fuzzy',
         autocomplete: {
+            state: AUTOCOMPLETE_STATE.ALWAYS,
             autoHide: false,
             style: 'theme',
             font: {
@@ -314,6 +327,8 @@ let power_user = {
     forbid_external_media: true,
     external_media_allowed_overrides: [],
     external_media_forbidden_overrides: [],
+    pin_styles: true,
+    click_to_edit: false,
 };
 
 let themes = [];
@@ -330,7 +345,6 @@ const contextControls = [
     { id: 'context_example_separator', property: 'example_separator', isCheckbox: false, isGlobalSetting: false },
     { id: 'context_chat_start', property: 'chat_start', isCheckbox: false, isGlobalSetting: false },
     { id: 'context_use_stop_strings', property: 'use_stop_strings', isCheckbox: true, isGlobalSetting: false, defaultValue: false },
-    { id: 'context_allow_jailbreak', property: 'allow_jailbreak', isCheckbox: true, isGlobalSetting: false, defaultValue: false },
     { id: 'context_names_as_stop_strings', property: 'names_as_stop_strings', isCheckbox: true, isGlobalSetting: false, defaultValue: true },
 
     // Existing power user settings
@@ -344,7 +358,7 @@ const debug_functions = [];
 
 const setHotswapsDebounced = debounce(favsToHotswap);
 
-function playMessageSound() {
+export function playMessageSound() {
     if (!power_user.play_message_sound) {
         return;
     }
@@ -369,7 +383,7 @@ function playMessageSound() {
  * @example
  * collapseNewlines("\n\n\n"); // "\n"
  */
-function collapseNewlines(x) {
+export function collapseNewlines(x) {
     return x.replaceAll(/\n+/g, '\n');
 }
 
@@ -390,7 +404,7 @@ function collapseNewlines(x) {
  * // and you HAVE to handle the cases where multiple pairs of asterisks exist in the same line
  * "^example * text* * harder problem *\n" // "^example *text* *harder problem*\n"
  */
-function fixMarkdown(text, forDisplay) {
+export function fixMarkdown(text, forDisplay) {
     // Find pairs of formatting characters and capture the text in between them
     const format = /([*_]{1,2})([\s\S]*?)\1/gm;
     let matches = [];
@@ -836,13 +850,13 @@ async function CreateZenSliders(elmnt) {
                     })
                     //trigger slider changes when user clicks away
                     .on('mouseup blur', function () {
-                        let manualInput = parseFloat(handle.text()).toFixed(decimals);
+                        let manualInput = parseFloat(parseFloat(handle.text()).toFixed(decimals));
                         if (isManualInput) {
                             //disallow manual inputs outside acceptable range
                             if (manualInput >= sliderMin && manualInput <= sliderMax) {
                                 //if value is ok, assign to slider and update handle text and position
                                 newSlider.val(manualInput);
-                                handleSlideEvent.call(newSlider, null, { value: parseFloat(manualInput) }, 'manual');
+                                handleSlideEvent.call(newSlider, null, { value: manualInput }, 'manual');
                                 valueBeforeManualInput = manualInput;
                             } else {
                                 //if value not ok, warn and reset to last known valid value
@@ -864,13 +878,13 @@ async function CreateZenSliders(elmnt) {
 
     function handleSlideEvent(event, ui, type) {
         var handle = $(this).find('.ui-slider-handle');
-        var numVal = Number(ui.value).toFixed(decimals);
-        offVal = Number(offVal).toFixed(decimals);
-        allVal = Number(allVal).toFixed(decimals);
+        var numVal = parseFloat(Number(ui.value).toFixed(decimals));
+        offVal = parseFloat(Number(offVal).toFixed(decimals));
+        allVal = parseFloat(Number(allVal).toFixed(decimals));
         console.log(numVal, sliderMin, sliderMax, numVal > sliderMax, numVal < sliderMin);
         if (numVal > sliderMax) { numVal = sliderMax; }
         if (numVal < sliderMin) { numVal = sliderMin; }
-        var stepNumber = ((ui.value - sliderMin) / stepScale).toFixed(0);
+        var stepNumber = parseFloat(((ui.value - sliderMin) / stepScale).toFixed(0));
         var handleText = (ui.value);
         var leftMargin = (stepNumber / numSteps) * 50 * -1;
         var perStepPercent = 1 / numSteps; //how far in % each step should be on the slider
@@ -951,23 +965,22 @@ function switchSpoilerMode() {
         $('#descriptionWrapper').hide();
         $('#firstMessageWrapper').hide();
         $('#spoiler_free_desc').addClass('flex1');
-        $('#creator_notes_spoiler').show();
+        $('#creators_note_desc_hidden').show();
     }
     else {
         $('#descriptionWrapper').show();
         $('#firstMessageWrapper').show();
         $('#spoiler_free_desc').removeClass('flex1');
-        $('#creator_notes_spoiler').hide();
+        $('#creators_note_desc_hidden').hide();
     }
 }
 
 function peekSpoilerMode() {
     $('#descriptionWrapper').toggle();
     $('#firstMessageWrapper').toggle();
-    $('#creator_notes_spoiler').toggle();
     $('#spoiler_free_desc').toggleClass('flex1');
+    $('#creators_note_desc_hidden').toggle();
 }
-
 
 function switchMovingUI() {
     $('.drawer-content.maximized').each(function () {
@@ -1004,14 +1017,14 @@ function applyNoShadows() {
 function applyAvatarStyle() {
     $('body').toggleClass('big-avatars', power_user.avatar_style === avatar_styles.RECTANGULAR);
     $('body').toggleClass('square-avatars', power_user.avatar_style === avatar_styles.SQUARE);
+    $('body').toggleClass('rounded-avatars', power_user.avatar_style === avatar_styles.ROUNDED);
     $('#avatar_style').val(power_user.avatar_style).prop('selected', true);
 }
 
 function applyChatDisplay() {
-
-    if (!power_user.chat_display === (null || undefined)) {
+    if ([null, undefined].includes(power_user.chat_display)) {
         console.debug('applyChatDisplay: saw no chat display type defined');
-        return;
+        power_user.chat_display = chat_styles.DEFAULT;
     }
     console.debug(`poweruser.chat_display ${power_user.chat_display}`);
     $('#chat_display').val(power_user.chat_display).prop('selected', true);
@@ -1036,6 +1049,17 @@ function applyChatDisplay() {
             break;
         }
     }
+}
+
+function applyToastrPosition() {
+    if (!toastPositionClasses.includes(power_user.toastr_position)) {
+        power_user.toastr_position = defaultToastPosition;
+        console.warn(`applyToastrPosition: invalid toastr position, defaulting to ${defaultToastPosition}`);
+    }
+
+    toastr.options.positionClass = power_user.toastr_position;
+    fixToastrForDialogs();
+    $('#toastr_position').val(power_user.toastr_position).prop('selected', true);
 }
 
 function applyChatWidth(type) {
@@ -1080,7 +1104,9 @@ function applyThemeColor(type) {
             document.documentElement.style.setProperty('--SmartThemeFastUIBGColor', power_user.fastui_bg_color);
         } */
     if (type === 'blurTint') {
+        let metaThemeColor = document.querySelector('meta[name=theme-color]');
         document.documentElement.style.setProperty('--SmartThemeBlurTintColor', power_user.blur_tint_color);
+        metaThemeColor.setAttribute('content', power_user.blur_tint_color);
     }
     if (type === 'chatTint') {
         document.documentElement.style.setProperty('--SmartThemeChatTintColor', power_user.chat_tint_color);
@@ -1201,6 +1227,12 @@ function applyTheme(name) {
             },
         },
         {
+            key: 'toastr_position',
+            action: () => {
+                applyToastrPosition();
+            },
+        },
+        {
             key: 'avatar_style',
             action: () => {
                 applyAvatarStyle();
@@ -1317,6 +1349,12 @@ function applyTheme(name) {
                 switchSwipeNumAllMessages();
             },
         },
+        {
+            key: 'click_to_edit',
+            action: () => {
+                $('#click_to_edit').prop('checked', power_user.click_to_edit);
+            },
+        },
     ];
 
     for (const { key, selector, type, action } of themeProperties) {
@@ -1365,7 +1403,7 @@ async function showDebugMenu() {
     callGenericPopup(template, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true });
 }
 
-function applyPowerUserSettings() {
+export function applyPowerUserSettings() {
     switchUiMode();
     applyFontScale('forced');
     applyThemeColor();
@@ -1387,6 +1425,50 @@ function applyPowerUserSettings() {
     switchSwipeNumAllMessages();
 }
 
+export function applyStylePins() {
+    try {
+        const existingPins = document.querySelector('#chat > .style-pins');
+        if (existingPins) {
+            existingPins.remove();
+        }
+
+        if (!power_user.pin_styles) {
+            return;
+        }
+
+        const firstDisplayed = getFirstDisplayedMessageId();
+        if (firstDisplayed === 0 || !isFinite(firstDisplayed)) {
+            return;
+        }
+
+        const chatElement = document.getElementById('chat');
+        if (!chatElement) {
+            return;
+        }
+
+        const firstMessage = chat[0];
+        if (!firstMessage) {
+            return;
+        }
+
+        const formattedMessage = messageFormatting(firstMessage.mes, firstMessage.name, firstMessage.is_system, firstMessage.is_user, 0, {}, false);
+        const htmlElement = document.createElement('div');
+        htmlElement.innerHTML = formattedMessage;
+
+        const styleTags = htmlElement.querySelectorAll('style');
+        if (styleTags.length === 0) {
+            return;
+        }
+
+        const pinsElement = document.createElement('div');
+        pinsElement.classList.add('style-pins');
+        pinsElement.append(...Array.from(styleTags));
+        chatElement.prepend(pinsElement);
+    } catch (error) {
+        console.error('Error applying style pins:', error);
+    }
+}
+
 function getExampleMessagesBehavior() {
     if (power_user.strip_examples) {
         return 'strip';
@@ -1399,10 +1481,15 @@ function getExampleMessagesBehavior() {
     return 'normal';
 }
 
-async function loadPowerUserSettings(settings, data) {
+//MARK: loadPowerUser
+export async function loadPowerUserSettings(settings, data) {
     const defaultStscript = JSON.parse(JSON.stringify(power_user.stscript));
     // Load from settings.json
     if (settings.power_user !== undefined) {
+        // Migrate old preference to a new setting
+        if (settings.power_user.click_to_edit === undefined && settings.power_user.chat_display === chat_styles.DOCUMENT) {
+            settings.power_user.click_to_edit = true;
+        }
         Object.assign(power_user, settings.power_user);
     }
 
@@ -1412,6 +1499,9 @@ async function loadPowerUserSettings(settings, data) {
         if (power_user.stscript.autocomplete === undefined) {
             power_user.stscript.autocomplete = defaultStscript.autocomplete;
         } else {
+            if (power_user.stscript.autocomplete.state === undefined) {
+                power_user.stscript.autocomplete.state = defaultStscript.autocomplete.state;
+            }
             if (power_user.stscript.autocomplete.width === undefined) {
                 power_user.stscript.autocomplete.width = defaultStscript.autocomplete.width;
             }
@@ -1448,15 +1538,15 @@ async function loadPowerUserSettings(settings, data) {
         context_presets = data.context;
     }
 
-    if (power_user.chat_display === '') {
+    if (typeof power_user.chat_display !== 'number') {
         power_user.chat_display = chat_styles.DEFAULT;
     }
 
-    if (power_user.waifuMode === '') {
+    if (typeof power_user.waifuMode !== 'boolean') {
         power_user.waifuMode = false;
     }
 
-    if (power_user.chat_width === '') {
+    if (typeof power_user.chat_width !== 'number') {
         power_user.chat_width = 50;
     }
 
@@ -1469,6 +1559,14 @@ async function loadPowerUserSettings(settings, data) {
         power_user.tag_import_setting = power_user.import_card_tags ? tag_import_setting.ASK : tag_import_setting.NONE;
         delete power_user.import_card_tags;
     }
+
+    if (power_user?.instruct?.derived === true) {
+        power_user.instruct_derived = true;
+        delete power_user.instruct.derived;
+    }
+
+    // Reset the saved chat template hash
+    power_user.chat_template_hash = '';
 
     $('#single_line').prop('checked', power_user.single_line);
     $('#relaxed_api_urls').prop('checked', power_user.relaxed_api_urls);
@@ -1495,6 +1593,7 @@ async function loadPowerUserSettings(settings, data) {
     $('#encode_tags').prop('checked', power_user.encode_tags);
     $('#example_messages_behavior').val(getExampleMessagesBehavior());
     $(`#example_messages_behavior option[value="${getExampleMessagesBehavior()}"]`).prop('selected', true);
+    $('#instruct_derived').parent().find('i').toggleClass('toggleEnabled', !!power_user.instruct_derived);
     $('#context_derived').parent().find('i').toggleClass('toggleEnabled', !!power_user.context_derived);
     $('#context_size_derived').prop('checked', !!power_user.context_size_derived);
 
@@ -1505,8 +1604,8 @@ async function loadPowerUserSettings(settings, data) {
     $('#auto_scroll_chat_to_bottom').prop('checked', power_user.auto_scroll_chat_to_bottom);
     $('#bogus_folders').prop('checked', power_user.bogus_folders);
     $('#zoomed_avatar_magnification').prop('checked', power_user.zoomed_avatar_magnification);
-    $(`#tokenizer option[value="${power_user.tokenizer}"]`).attr('selected', true);
-    $(`#send_on_enter option[value=${power_user.send_on_enter}]`).attr('selected', true);
+    $(`#tokenizer option[value="${power_user.tokenizer}"]`).prop('selected', true);
+    $(`#send_on_enter option[value=${power_user.send_on_enter}]`).prop('selected', true);
     $('#confirm_message_delete').prop('checked', power_user.confirm_message_delete !== undefined ? !!power_user.confirm_message_delete : true);
     $('#spoiler_free_mode').prop('checked', power_user.spoiler_free_mode);
     $('#collapse-newlines-checkbox').prop('checked', power_user.collapse_newlines);
@@ -1542,12 +1641,14 @@ async function loadPowerUserSettings(settings, data) {
     $('#enableZenSliders').prop('checked', power_user.enableZenSliders).trigger('input');
     $('#enableLabMode').prop('checked', power_user.enableLabMode).trigger('input', { fromInit: true });
     $(`input[name="avatar_style"][value="${power_user.avatar_style}"]`).prop('checked', true);
-    $(`#chat_display option[value=${power_user.chat_display}]`).attr('selected', true).trigger('change');
+    $(`#chat_display option[value=${power_user.chat_display}]`).prop('selected', true).trigger('change');
+    $(`#toastr_position option[value=${power_user.toastr_position}]`).prop('selected', true).trigger('change');
     $('#chat_width_slider').val(power_user.chat_width);
     $('#token_padding').val(power_user.token_padding);
     $('#aux_field').val(power_user.aux_field);
     $('#tag_import_setting').val(power_user.tag_import_setting);
 
+    $('#stscript_autocomplete_state').val(power_user.stscript.autocomplete.state).trigger('input');
     $('#stscript_autocomplete_autoHide').prop('checked', power_user.stscript.autocomplete.autoHide ?? false).trigger('input');
     $('#stscript_matching').val(power_user.stscript.matching ?? 'fuzzy');
     $('#stscript_autocomplete_style').val(power_user.stscript.autocomplete.style ?? 'theme');
@@ -1597,6 +1698,8 @@ async function loadPowerUserSettings(settings, data) {
     $('#auto-connect-checkbox').prop('checked', power_user.auto_connect);
     $('#auto-load-chat-checkbox').prop('checked', power_user.auto_load_chat);
     $('#forbid_external_media').prop('checked', power_user.forbid_external_media);
+    $('#pin_styles').prop('checked', power_user.pin_styles);
+    $('#click_to_edit').prop('checked', power_user.click_to_edit);
 
     for (const theme of themes) {
         const option = document.createElement('option');
@@ -1622,12 +1725,14 @@ async function loadPowerUserSettings(settings, data) {
     await loadInstructMode(data);
     await loadContextSettings();
     await loadSystemPrompts(data);
+    await loadReasoningTemplates(data);
     loadMaxContextUnlocked();
     switchWaifuMode();
     switchSpoilerMode();
     loadMovingUIState();
     loadCharListState();
     toggleMDHotkeyIconDisplay();
+    applyToastrPosition();
 }
 
 function toggleMDHotkeyIconDisplay() {
@@ -1644,7 +1749,7 @@ function loadCharListState() {
     document.body.classList.toggle('charListGrid', power_user.charListGrid);
 }
 
-function loadMovingUIState() {
+export function loadMovingUIState() {
     if (!isMobile()
         && power_user.movingUIState
         && power_user.movingUI === true) {
@@ -1734,7 +1839,7 @@ function switchMaxContextSize() {
 }
 
 // Fetch a compiled object of all preset settings
-function getContextSettings() {
+export function getContextSettings() {
     let compiledSettings = {};
 
     contextControls.forEach((control) => {
@@ -1807,6 +1912,7 @@ async function loadContextSettings() {
         }
 
         power_user.context.preset = name;
+
         contextControls.forEach(control => {
             const presetValue = preset[control.property] ?? control.defaultValue;
 
@@ -1840,6 +1946,8 @@ async function loadContextSettings() {
                 }
             }
         }
+
+        updateBindModelTemplatesState();
 
         saveSettingsDebounced();
     });
@@ -1983,15 +2091,21 @@ export function fuzzySearchGroups(searchValue, fuzzySearchCaches = null) {
 /**
  * Renders a story string template with the given parameters.
  * @param {object} params Template parameters.
+ * @param {object} [options] Additional options.
+ * @param {string} [options.customStoryString] Custom story string template.
+ * @param {InstructSettings} [options.customInstructSettings] Custom instruct settings.
  * @returns {string} The rendered story string.
  */
-export function renderStoryString(params) {
+export function renderStoryString(params, { customStoryString = null, customInstructSettings = null } = {}) {
     try {
+        const storyString = customStoryString ?? power_user.context.story_string;
+        const instructSettings = structuredClone(customInstructSettings ?? power_user.instruct);
+
         // Validate and log possible warnings/errors
-        validateStoryString(power_user.context.story_string, params);
+        validateStoryString(storyString, params);
 
         // compile the story string template into a function, with no HTML escaping
-        const compiledTemplate = Handlebars.compile(power_user.context.story_string, { noEscape: true });
+        const compiledTemplate = Handlebars.compile(storyString, { noEscape: true });
 
         // render the story string template with the given params
         let output = compiledTemplate(params);
@@ -2004,7 +2118,7 @@ export function renderStoryString(params) {
 
         // add a newline to the end of the story string if it doesn't have one
         if (output.length > 0 && !output.endsWith('\n')) {
-            if (!power_user.instruct.enabled || power_user.instruct.wrap) {
+            if (!instructSettings.enabled || instructSettings.wrap) {
                 output += '\n';
             }
         }
@@ -2238,7 +2352,7 @@ async function saveTheme(name = undefined, theme = undefined) {
             return;
         }
 
-        name = String(newName);
+        name = await getSanitizedFilename(String(newName));
     }
 
     if (typeof theme !== 'object') {
@@ -2269,7 +2383,7 @@ async function saveTheme(name = undefined, theme = undefined) {
     }
     else {
         themes[themeIndex] = theme;
-        $(`#themes option[value="${name}"]`).attr('selected', true);
+        $(`#themes option[value="${name}"]`).prop('selected', true);
     }
 
     power_user.theme = name;
@@ -2303,6 +2417,7 @@ function getThemeObject(name) {
         waifuMode: power_user.waifuMode,
         avatar_style: power_user.avatar_style,
         chat_display: power_user.chat_display,
+        toastr_position: power_user.toastr_position,
         noShadows: power_user.noShadows,
         chat_width: power_user.chat_width,
         timer_enabled: power_user.timer_enabled,
@@ -2322,6 +2437,7 @@ function getThemeObject(name) {
         reduced_motion: power_user.reduced_motion,
         compact_input_area: power_user.compact_input_area,
         show_swipe_num_all_messages: power_user.show_swipe_num_all_messages,
+        click_to_edit: power_user.click_to_edit,
     };
 }
 
@@ -2347,7 +2463,7 @@ async function saveMovingUI() {
         return;
     }
 
-    const name = String(popupResult);
+    const name = await getSanitizedFilename(String(popupResult));
 
     const movingUIPreset = {
         name,
@@ -2374,7 +2490,7 @@ async function saveMovingUI() {
         }
         else {
             movingUIPresets[movingUIPresetIndex] = movingUIPreset;
-            $(`#movingUIPresets option[value="${name}"]`).attr('selected', true);
+            $(`#movingUIPresets option[value="${name}"]`).prop('selected', true);
         }
 
         power_user.movingUIPreset = name;
@@ -3021,7 +3137,7 @@ export function forceCharacterEditorTokenize() {
     $('#character_popup').trigger('input');
 }
 
-$(document).ready(() => {
+jQuery(() => {
     const adjustAutocompleteDebounced = debounce(() => {
         $('.ui-autocomplete-input').each(function () {
             const isOpen = $(this).autocomplete('widget')[0].style.display !== 'none';
@@ -3032,7 +3148,7 @@ $(document).ready(() => {
     });
 
     const reportZoomLevelDebounced = debounce(() => {
-        const zoomLevel = Number(window.devicePixelRatio).toFixed(2) || 1;
+        const zoomLevel = parseFloat(Number(window.devicePixelRatio).toFixed(2)) || 1;
         const winWidth = window.innerWidth;
         const winHeight = window.innerHeight;
         const originalWidth = winWidth * zoomLevel;
@@ -3057,8 +3173,8 @@ $(document).ready(() => {
 
         //attempt to scale movingUI elements naturally across window resizing/zooms
         //this will still break if the zoom level causes mobile styles to come into play.
-        const scaleY = Number(window.innerHeight / coreTruthWinHeight).toFixed(4);
-        const scaleX = Number(window.innerWidth / coreTruthWinWidth).toFixed(4);
+        const scaleY = parseFloat(Number(window.innerHeight / coreTruthWinHeight).toFixed(4));
+        const scaleX = parseFloat(Number(window.innerWidth / coreTruthWinWidth).toFixed(4));
 
         if (Object.keys(power_user.movingUIState).length > 0) {
             for (var elmntName of Object.keys(power_user.movingUIState)) {
@@ -3106,7 +3222,7 @@ $(document).ready(() => {
     });
 
     // Settings that go to settings.json
-    $('#collapse-newlines-checkbox').change(function () {
+    $('#collapse-newlines-checkbox').on('change', function () {
         power_user.collapse_newlines = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -3114,7 +3230,7 @@ $(document).ready(() => {
     // include newline is the child of trim sentences
     // if include newline is checked, trim sentences must be checked
     // if trim sentences is unchecked, include newline must be unchecked
-    $('#trim_sentences_checkbox').change(function () {
+    $('#trim_sentences_checkbox').on('change', function () {
         power_user.trim_sentences = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -3135,6 +3251,16 @@ $(document).ready(() => {
         $('#context_derived').parent().find('i').toggleClass('toggleEnabled', !!power_user.context_derived);
     });
 
+    $('#instruct_derived').on('input', function () {
+        const value = !!$(this).prop('checked');
+        power_user.instruct_derived = value;
+        saveSettingsDebounced();
+    });
+
+    $('#instruct_derived').on('change', function () {
+        $('#instruct_derived').parent().find('i').toggleClass('toggleEnabled', !!power_user.instruct_derived);
+    });
+
     $('#context_size_derived').on('input', function () {
         const value = !!$(this).prop('checked');
         power_user.context_size_derived = value;
@@ -3145,7 +3271,15 @@ $(document).ready(() => {
         $('#context_size_derived').prop('checked', !!power_user.context_size_derived);
     });
 
-    $('#always-force-name2-checkbox').change(function () {
+    $('#bind_model_templates').on('input', function () {
+        if (bindModelTemplates(power_user, online_status)) {
+            saveSettingsDebounced();
+        }
+    });
+
+    $('#bind_model_templates').on('change', updateBindModelTemplatesState);
+
+    $('#always-force-name2-checkbox').on('change', function () {
         power_user.always_force_name2 = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -3161,7 +3295,7 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
-    $('#chat-show-reply-prefix-checkbox').change(function () {
+    $('#chat-show-reply-prefix-checkbox').on('change', function () {
         power_user.show_user_prompt_bias = !!$(this).prop('checked');
         reloadCurrentChat();
         saveSettingsDebounced();
@@ -3207,14 +3341,14 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
-    $('#fast_ui_mode').change(function () {
+    $('#fast_ui_mode').on('change', function () {
         power_user.fast_ui_mode = $(this).prop('checked');
         switchUiMode();
         saveSettingsDebounced();
     });
 
     $('#waifuMode').on('change', () => {
-        power_user.waifuMode = $('#waifuMode').prop('checked');
+        power_user.waifuMode = !!$('#waifuMode').prop('checked');
         switchWaifuMode();
         saveSettingsDebounced();
     });
@@ -3225,13 +3359,13 @@ $(document).ready(() => {
         applyCustomCSS();
     });
 
-    $('#movingUImode').change(function () {
+    $('#movingUImode').on('change', function () {
         power_user.movingUI = $(this).prop('checked');
         switchMovingUI();
         saveSettingsDebounced();
     });
 
-    $('#noShadowsmode').change(function () {
+    $('#noShadowsmode').on('change', function () {
         power_user.noShadows = $(this).prop('checked');
         applyNoShadows();
         saveSettingsDebounced();
@@ -3253,9 +3387,16 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
+    $('#toastr_position').on('change', function () {
+        const value = $(this).find(':selected').val();
+        power_user.toastr_position = String(value);
+        applyToastrPosition();
+        saveSettingsDebounced();
+    });
+
     $('#chat_width_slider').on('input', function (e, data) {
         const applyMode = data?.forced ? 'forced' : 'normal';
-        power_user.chat_width = Number(e.target.value);
+        power_user.chat_width = Number($(this).val());
         applyChatWidth(applyMode);
         saveSettingsDebounced();
         setHotswapsDebounced();
@@ -3285,81 +3426,81 @@ $(document).ready(() => {
 
     $('input[name="font_scale"]').on('input', async function (e, data) {
         const applyMode = data?.forced ? 'forced' : 'normal';
-        power_user.font_scale = Number(e.target.value);
+        power_user.font_scale = Number($(this).val());
         $('#font_scale_counter').val(power_user.font_scale);
         applyFontScale(applyMode);
         saveSettingsDebounced();
     });
 
     $('input[name="blur_strength"]').on('input', async function (e) {
-        power_user.blur_strength = Number(e.target.value);
+        power_user.blur_strength = Number($(this).val());
         $('#blur_strength_counter').val(power_user.blur_strength);
         applyBlurStrength();
         saveSettingsDebounced();
     });
 
     $('input[name="shadow_width"]').on('input', async function (e) {
-        power_user.shadow_width = Number(e.target.value);
+        power_user.shadow_width = Number($(this).val());
         $('#shadow_width_counter').val(power_user.shadow_width);
         applyShadowWidth();
         saveSettingsDebounced();
     });
 
-    $('#main-text-color-picker').on('change', (evt) => {
+    $('#main-text-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.main_text_color = evt.detail.rgba;
         applyThemeColor('main');
         saveSettingsDebounced();
     });
 
-    $('#italics-color-picker').on('change', (evt) => {
+    $('#italics-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.italics_text_color = evt.detail.rgba;
         applyThemeColor('italics');
         saveSettingsDebounced();
     });
 
-    $('#underline-color-picker').on('change', (evt) => {
+    $('#underline-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.underline_text_color = evt.detail.rgba;
         applyThemeColor('underline');
         saveSettingsDebounced();
     });
 
-    $('#quote-color-picker').on('change', (evt) => {
+    $('#quote-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.quote_text_color = evt.detail.rgba;
         applyThemeColor('quote');
         saveSettingsDebounced();
     });
 
-    $('#blur-tint-color-picker').on('change', (evt) => {
+    $('#blur-tint-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.blur_tint_color = evt.detail.rgba;
         applyThemeColor('blurTint');
         saveSettingsDebounced();
     });
 
-    $('#chat-tint-color-picker').on('change', (evt) => {
+    $('#chat-tint-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.chat_tint_color = evt.detail.rgba;
         applyThemeColor('chatTint');
         saveSettingsDebounced();
     });
 
-    $('#user-mes-blur-tint-color-picker').on('change', (evt) => {
+    $('#user-mes-blur-tint-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.user_mes_blur_tint_color = evt.detail.rgba;
         applyThemeColor('userMesBlurTint');
         saveSettingsDebounced();
     });
 
-    $('#bot-mes-blur-tint-color-picker').on('change', (evt) => {
+    $('#bot-mes-blur-tint-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.bot_mes_blur_tint_color = evt.detail.rgba;
         applyThemeColor('botMesBlurTint');
         saveSettingsDebounced();
     });
 
-    $('#shadow-color-picker').on('change', (evt) => {
+    $('#shadow-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.shadow_color = evt.detail.rgba;
         applyThemeColor('shadow');
         saveSettingsDebounced();
     });
 
-    $('#border-color-picker').on('change', (evt) => {
+    $('#border-color-picker').on('change', (/** @type {ColorPickerEvent} */ evt) => {
         power_user.border_color = evt.detail.rgba;
         applyThemeColor('border');
         saveSettingsDebounced();
@@ -3683,7 +3824,8 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
-    $('#spoiler_free_desc_button').on('click', function () {
+    $('#spoiler_free_desc_button').on('click', function (e) {
+        e.stopPropagation();
         peekSpoilerMode();
         $(this).toggleClass('fa-eye fa-eye-slash');
     });
@@ -3693,7 +3835,7 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
-    $('#custom_stopping_strings_macro').change(function () {
+    $('#custom_stopping_strings_macro').on('change', function () {
         power_user.custom_stopping_strings_macro = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
@@ -3755,6 +3897,11 @@ $(document).ready(() => {
     $('#tag_import_setting').on('change', function () {
         const value = $(this).find(':selected').val();
         power_user.tag_import_setting = Number(value);
+        saveSettingsDebounced();
+    });
+
+    $('#stscript_autocomplete_state').on('input', function () {
+        power_user.stscript.autocomplete.state = Number($(this).val());
         saveSettingsDebounced();
     });
 
@@ -3864,6 +4011,17 @@ $(document).ready(() => {
         power_user.forbid_external_media = !!$(this).prop('checked');
         saveSettingsDebounced();
         reloadCurrentChat();
+    });
+
+    $('#pin_styles').on('input', function () {
+        power_user.pin_styles = !!$(this).prop('checked');
+        saveSettingsDebounced();
+        applyStylePins();
+    });
+
+    $('#click_to_edit').on('input', function () {
+        power_user.click_to_edit = !!$(this).prop('checked');
+        saveSettingsDebounced();
     });
 
     $('#ui_preset_import_button').on('click', function () {
@@ -4217,7 +4375,7 @@ $(document).ready(() => {
                 enumList: commonEnumProviders.boolean('trueFalse')(),
             }),
         ],
-        unnamedArgumentList:[
+        unnamedArgumentList: [
             SlashCommandArgument.fromProps({
                 description: 'value',
                 typeList: [ARGUMENT_TYPE.STRING],
@@ -4227,14 +4385,13 @@ $(document).ready(() => {
         ],
         callback: (args, value) => {
             const force = isTrueBoolean(String(args?.force ?? false));
-            value = String(value ?? '').trim();
 
             // Skip processing if no value and not forced
             if (!force && !value) {
                 return power_user.user_prompt_bias;
             }
 
-            power_user.user_prompt_bias = value;
+            power_user.user_prompt_bias = String(value ?? '');
             $('#start_reply_with').val(power_user.user_prompt_bias);
             saveSettingsDebounced();
 

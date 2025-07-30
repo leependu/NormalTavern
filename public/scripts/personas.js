@@ -22,11 +22,11 @@ import {
 } from '../script.js';
 import { persona_description_positions, power_user } from './power-user.js';
 import { getTokenCountAsync } from './tokenizers.js';
-import { PAGINATION_TEMPLATE, clearInfoBlock, debounce, delay, download, ensureImageFormatSupported, flashHighlight, getBase64Async, getCharIndex, isFalseBoolean, isTrueBoolean, onlyUnique, parseJsonFile, setInfoBlock } from './utils.js';
+import { PAGINATION_TEMPLATE, clearInfoBlock, debounce, delay, download, ensureImageFormatSupported, flashHighlight, getBase64Async, getCharIndex, isFalseBoolean, isTrueBoolean, onlyUnique, parseJsonFile, setInfoBlock, localizePagination, renderPaginationDropdown, paginationDropdownChangeHandler } from './utils.js';
 import { debounce_timeout } from './constants.js';
 import { FILTER_TYPES, FilterHelper } from './filters.js';
 import { groups, selected_group } from './group-chats.js';
-import { POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
+import { POPUP_RESULT, POPUP_TYPE, Popup, callGenericPopup } from './popup.js';
 import { t } from './i18n.js';
 import { openWorldInfoEditor, world_names } from './world-info.js';
 import { renderTemplateAsync } from './templates.js';
@@ -37,6 +37,7 @@ import { SlashCommandNamedArgument, ARGUMENT_TYPE, SlashCommandArgument } from '
 import { commonEnumProviders } from './slash-commands/SlashCommandCommonEnumsProvider.js';
 import { SlashCommandEnumValue } from './slash-commands/SlashCommandEnumValue.js';
 import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
+import { isFirefox } from './browser-fixes.js';
 
 /**
  * @typedef {object} PersonaConnection A connection between a character and a character or group entity
@@ -111,6 +112,7 @@ export function setUserAvatar(imgfile, { toastPersonaNameChange = true, navigate
     reloadUserAvatar();
     updatePersonaUIStates({ navigateToCurrent: navigateToCurrent });
     selectCurrentPersona({ toastPersonaNameChange: toastPersonaNameChange });
+    retriggerFirstMessageOnEmptyChat();
     saveSettingsDebounced();
     $('.zoomed_avatar[forchar]').remove();
 }
@@ -123,7 +125,7 @@ function reloadUserAvatar(force = false) {
         }
 
         if ($(this).attr('is_user') == 'true' && $(this).attr('force_avatar') == 'false') {
-            avatarImg.attr('src', getUserAvatar(user_avatar));
+            avatarImg.attr('src', getThumbnailUrl('persona', user_avatar));
         }
     });
 }
@@ -131,7 +133,7 @@ function reloadUserAvatar(force = false) {
 /**
  * Sort the given personas
  * @param {string[]} personas - The persona names to sort
- * @returns {string[]} The sorted persona names arrray, same reference as passed in
+ * @returns {string[]} The sorted persona names array, same reference as passed in
  */
 function sortPersonas(personas) {
     const option = $('#persona_sort_order').find(':selected');
@@ -178,20 +180,18 @@ function verifyPersonaSearchSortRule() {
  * @returns {JQuery<HTMLElement>} Avatar block
  */
 function getUserAvatarBlock(avatarId) {
-    const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
     const template = $('#user_avatar_template .avatar-container').clone();
     const personaName = power_user.personas[avatarId];
     const personaDescription = power_user.persona_descriptions[avatarId]?.description;
+    const personaTitle = power_user.persona_descriptions[avatarId]?.title;
 
     template.find('.ch_name').text(personaName || '[Unnamed Persona]');
     template.find('.ch_description').text(personaDescription || $('#user_avatar_block').attr('no_desc_text')).toggleClass('text_muted', !personaDescription);
+    template.find('.ch_additional_info').text(personaTitle || '');
     template.attr('data-avatar-id', avatarId);
     template.find('.avatar').attr('data-avatar-id', avatarId).attr('title', avatarId);
     template.toggleClass('default_persona', avatarId === power_user.default_persona);
-    let avatarUrl = getUserAvatar(avatarId);
-    if (isFirefox) {
-        avatarUrl += '?t=' + Date.now();
-    }
+    const avatarUrl = getThumbnailUrl('persona', avatarId, isFirefox());
     template.find('img').attr('src', avatarUrl);
 
     // Make sure description block has at least three rows. Otherwise height looks inconsistent. I don't have a better idea for this.
@@ -211,7 +211,7 @@ function getUserAvatarBlock(avatarId) {
 function addMissingPersonas(avatarsList) {
     for (const persona of avatarsList) {
         if (!power_user.personas[persona]) {
-            initPersona(persona, '[Unnamed Persona]', '');
+            initPersona(persona, '[Unnamed Persona]', '', '');
         }
     }
 }
@@ -249,16 +249,18 @@ export async function getUserAvatars(doRender = true, openPageAt = '') {
         const storageKey = 'Personas_PerPage';
         const listId = '#user_avatar_block';
         const perPage = Number(accountStorage.getItem(storageKey)) || 5;
+        const sizeChangerOptions = [5, 10, 25, 50, 100, 250, 500, 1000];
 
         $('#persona_pagination_container').pagination({
             dataSource: entities,
             pageSize: perPage,
-            sizeChangerOptions: [5, 10, 25, 50, 100, 250, 500, 1000],
+            sizeChangerOptions,
             pageRange: 1,
             pageNumber: savePersonasPage || 1,
             position: 'top',
             showPageNumbers: false,
             showSizeChanger: true,
+            formatSizeChanger: renderPaginationDropdown(perPage, sizeChangerOptions),
             prevText: '<',
             nextText: '>',
             formatNavigator: PAGINATION_TEMPLATE,
@@ -269,9 +271,11 @@ export async function getUserAvatars(doRender = true, openPageAt = '') {
                     $(listId).append(getUserAvatarBlock(item));
                 }
                 updatePersonaUIStates();
+                localizePagination($('#persona_pagination_container'));
             },
-            afterSizeSelectorChange: function (e) {
+            afterSizeSelectorChange: function (e, size) {
                 accountStorage.setItem(storageKey, e.target.value);
+                paginationDropdownChangeHandler(e, size);
             },
             afterPaging: function (e) {
                 savePersonasPage = e;
@@ -313,12 +317,9 @@ async function uploadUserAvatar(url, name) {
         formData.append('overwrite_name', name);
     }
 
-    const headers = getRequestHeaders();
-    delete headers['Content-Type'];
-
     await fetch('/api/avatars/upload', {
         method: 'POST',
-        headers: headers,
+        headers: getRequestHeaders({ omitContentType: true }),
         cache: 'no-cache',
         body: formData,
     });
@@ -364,12 +365,9 @@ async function changeUserAvatar(e) {
         formData.set('avatar', convertedFile);
     }
 
-    const headers = getRequestHeaders();
-    delete headers['Content-Type'];
-
     const response = await fetch(url, {
         method: 'POST',
-        headers: headers,
+        headers: getRequestHeaders({ omitContentType:true }),
         cache: 'no-cache',
         body: formData,
     });
@@ -381,6 +379,7 @@ async function changeUserAvatar(e) {
         const name = formData.get('overwrite_name');
         if (name) {
             await fetch(getUserAvatar(String(name)), { cache: 'no-cache' });
+            await fetch(getThumbnailUrl('persona', String(name)), { cache: 'no-cache' });
             reloadUserAvatar(true);
         }
 
@@ -412,23 +411,32 @@ export async function createPersona(avatarId) {
 
     const personaDescription = await Popup.show.input(t`Enter a description for this persona:`, t`You can always add or change it later.`, '', { rows: 4 });
 
-    initPersona(avatarId, personaName, personaDescription);
+    initPersona(avatarId, personaName, personaDescription, '');
     if (power_user.persona_show_notifications) {
         toastr.success(t`You can now pick ${personaName} as a persona in the Persona Management menu.`, t`Persona Created`);
     }
 }
 
 async function createDummyPersona() {
-    const personaName = await Popup.show.input(t`Enter a name for this persona:`, null);
+    const popup = new Popup(t`Enter a name for this persona:`, POPUP_TYPE.INPUT, '', {
+        customInputs: [{
+            id: 'persona_title',
+            type: 'text',
+            label: t`Persona Title (optional, display only)`,
+        }],
+    });
 
-    if (!personaName) {
+    const personaName = await popup.show();
+    const personaTitle = String(popup.inputResults.get('persona_title') || '').trim();
+
+    if (!personaName || typeof personaName !== 'string') {
         console.debug('User cancelled creating dummy persona');
         return;
     }
 
     // Date + name (only ASCII) to make it unique
     const avatarId = `${Date.now()}-${personaName.replace(/[^a-zA-Z0-9]/g, '')}.png`;
-    initPersona(avatarId, personaName, '');
+    initPersona(avatarId, personaName, '', personaTitle);
     await uploadUserAvatar(default_user_avatar, avatarId);
 }
 
@@ -437,9 +445,10 @@ async function createDummyPersona() {
  * @param {string} avatarId User avatar id
  * @param {string} personaName Name for the persona
  * @param {string} personaDescription Optional description for the persona
+ * @param {string} personaTitle Optional title for the persona
  * @returns {void}
  */
-export function initPersona(avatarId, personaName, personaDescription) {
+export function initPersona(avatarId, personaName, personaDescription, personaTitle) {
     power_user.personas[avatarId] = personaName;
     power_user.persona_descriptions[avatarId] = {
         description: personaDescription || '',
@@ -447,6 +456,7 @@ export function initPersona(avatarId, personaName, personaDescription) {
         depth: DEFAULT_DEPTH,
         role: DEFAULT_ROLE,
         lorebook: '',
+        title: personaTitle || '',
     };
 
     saveSettingsDebounced();
@@ -465,7 +475,7 @@ export function initPersona(avatarId, personaName, personaDescription) {
  * @returns {Promise<boolean>} A promise that resolves to true if the character was converted, false otherwise.
  */
 export async function convertCharacterToPersona(characterId = null) {
-    if (null === characterId) characterId = this_chid;
+    if (null === characterId) characterId = Number(this_chid);
 
     const avatarUrl = characters[characterId]?.avatar;
     if (!avatarUrl) {
@@ -503,6 +513,7 @@ export async function convertCharacterToPersona(characterId = null) {
         depth: DEFAULT_DEPTH,
         role: DEFAULT_ROLE,
         lorebook: '',
+        title: '',
     };
 
     // If the user is currently using this persona, update the description
@@ -727,13 +738,58 @@ export function autoSelectPersona(name) {
 }
 
 /**
+ * Edits the title of a persona based on the input from a popup.
+ * @param {Popup} popup Popup instance
+ * @param {string} avatarId Avatar ID of the persona to edit
+ * @param {string} currentTitle Current title of the persona
+ */
+async function editPersonaTitle(popup, avatarId, currentTitle) {
+    if (popup.result !== POPUP_RESULT.AFFIRMATIVE) {
+        return;
+    }
+
+    if (!power_user.persona_descriptions[avatarId]) {
+        console.warn('Uninitialized persona descriptor for avatar:', avatarId);
+        return;
+    }
+
+    const newTitle = String(popup.inputResults.get('persona_title') || '').trim();
+
+    if (!newTitle && currentTitle) {
+        console.log(`Removed persona title for ${avatarId}`);
+        delete power_user.persona_descriptions[avatarId].title;
+        await getUserAvatars(true, avatarId);
+        saveSettingsDebounced();
+        return;
+    }
+
+    if (newTitle !== currentTitle) {
+        power_user.persona_descriptions[avatarId].title = newTitle;
+        console.log(`Updated persona title for ${avatarId} to ${newTitle}`);
+        await getUserAvatars(true, avatarId);
+        saveSettingsDebounced();
+        return;
+    }
+}
+
+/**
  * Renames the persona with the given avatar ID by showing a popup to enter a new name.
  * @param {string} avatarId - ID of the avatar to rename
  * @returns {Promise<boolean>} A promise that resolves to true if the persona was renamed, false otherwise
  */
 async function renamePersona(avatarId) {
     const currentName = power_user.personas[avatarId];
-    const newName = await Popup.show.input(t`Rename Persona`, t`Enter a new name for this persona:`, currentName);
+    const currentTitle = power_user.persona_descriptions[avatarId]?.title || '';
+    const newName = await Popup.show.input(t`Rename Persona`, t`Enter a new name for this persona:`, currentName, {
+        customInputs: [{
+            id: 'persona_title',
+            type: 'text',
+            label: t`Persona Title (optional, display only)`,
+            defaultState: currentTitle,
+        }],
+        onClose: (popup) => editPersonaTitle(popup, avatarId, currentTitle),
+    });
+
     if (!newName || newName === currentName) {
         console.debug('User cancelled renaming persona or name is unchanged');
         return false;
@@ -790,6 +846,7 @@ async function selectCurrentPersona({ toastPersonaNameChange = true } = {}) {
                 role: DEFAULT_ROLE,
                 lorebook: '',
                 connections: [],
+                title: '',
             };
         }
 
@@ -800,7 +857,7 @@ async function selectCurrentPersona({ toastPersonaNameChange = true } = {}) {
             chat_metadata['persona'] = user_avatar;
             console.log(`Auto locked persona to ${user_avatar}`);
             if (toastPersonaNameChange && power_user.persona_show_notifications) {
-                toastr.success(`Persona ${personaName} selected and auto-locked to current chat`, t`Persona Selected`);
+                toastr.success(t`Persona ${personaName} selected and auto-locked to current chat`, t`Persona Selected`);
             }
             saveMetadataDebounced();
             updatePersonaUIStates();
@@ -936,6 +993,7 @@ async function lockPersona(type = 'chat') {
             role: DEFAULT_ROLE,
             lorebook: '',
             connections: [],
+            title: '',
         };
     }
 
@@ -1002,7 +1060,9 @@ async function deleteUserAvatar() {
         console.warn('No avatar id found');
         return;
     }
-    const confirm = await Popup.show.confirm(t`Delete Persona`,
+    const name = power_user.personas[avatarId] || '';
+    const confirm = await Popup.show.confirm(
+        t`Delete Persona` + `: ${name}`,
         t`Are you sure you want to delete this avatar?` + '<br />' + t`All information associated with its linked persona will be lost.`);
 
     if (!confirm) {
@@ -1055,6 +1115,7 @@ function onPersonaDescriptionInput() {
                 depth: Number($('#persona_depth_value').val()),
                 role: Number($('#persona_depth_role').find(':selected').val()),
                 lorebook: '',
+                title: '',
             };
             power_user.persona_descriptions[user_avatar] = object;
         }
@@ -1161,6 +1222,7 @@ function getOrCreatePersonaDescriptor() {
             role: power_user.persona_description_role,
             lorebook: power_user.persona_description_lorebook,
             connections: [],
+            title: '',
         };
         power_user.persona_descriptions[user_avatar] = object;
     }
@@ -1243,7 +1305,7 @@ function getPersonaStates(avatarId) {
     /** @type {PersonaConnection[]} */
     const connections = power_user.persona_descriptions[avatarId]?.connections;
     const hasCharLock = !!connections?.some(c =>
-        (!selected_group && c.type === 'character' && c.id === characters[this_chid]?.avatar)
+        (!selected_group && c.type === 'character' && c.id === characters[Number(this_chid)]?.avatar)
         || (selected_group && c.type === 'group' && c.id === selected_group));
 
     return {
@@ -1481,7 +1543,7 @@ async function loadPersonaForCurrentChat({ doRender = false } = {}) {
  * @returns {string[]} - An array of persona keys that are connected to the given character key
  */
 export function getConnectedPersonas(characterKey = undefined) {
-    characterKey ??= selected_group || characters[this_chid]?.avatar;
+    characterKey ??= selected_group || characters[Number(this_chid)]?.avatar;
     const connectedPersonas = Object.entries(power_user.persona_descriptions)
         .filter(([_, desc]) => desc.connections?.some(conn => conn.type === 'character' && conn.id === characterKey))
         .map(([key, _]) => key);
@@ -1513,7 +1575,7 @@ export async function showCharConnections() {
                 console.log(`Unlocking persona ${personaId} from current character ${name2}`);
                 power_user.persona_descriptions[personaId].connections = connections.filter(c => {
                     if (menu_type == 'group_edit' && c.type == 'group' && c.id == selected_group) return false;
-                    else if (c.type == 'character' && c.id == characters[this_chid]?.avatar) return false;
+                    else if (c.type == 'character' && c.id == characters[Number(this_chid)]?.avatar) return false;
                     return true;
                 });
                 saveSettingsDebounced();
@@ -1545,8 +1607,8 @@ export async function showCharConnections() {
 export function getCurrentConnectionObj() {
     if (selected_group)
         return { type: 'group', id: selected_group };
-    if (characters[this_chid]?.avatar)
-        return { type: 'character', id: characters[this_chid]?.avatar };
+    if (characters[Number(this_chid)]?.avatar)
+        return { type: 'character', id: characters[Number(this_chid)]?.avatar };
     return null;
 }
 
@@ -1650,7 +1712,7 @@ async function syncUserNameToPersona() {
     for (const mes of chat) {
         if (mes.is_user) {
             mes.name = name1;
-            mes.force_avatar = getUserAvatar(user_avatar);
+            mes.force_avatar = getThumbnailUrl('persona', user_avatar);
         }
     }
 
@@ -1664,7 +1726,7 @@ async function syncUserNameToPersona() {
  * Only works if only the first message is present, and not in group mode.
  */
 export function retriggerFirstMessageOnEmptyChat() {
-    if (this_chid >= 0 && !selected_group && chat.length === 1) {
+    if (Number(this_chid) >= 0 && !selected_group && chat.length === 1) {
         $('#firstmessage_textarea').trigger('input');
     }
 }
@@ -1699,6 +1761,7 @@ async function duplicatePersona(avatarId) {
         depth: descriptor?.depth ?? DEFAULT_DEPTH,
         role: descriptor?.role ?? DEFAULT_ROLE,
         lorebook: descriptor?.lorebook ?? '',
+        title: descriptor?.title ?? '',
     };
 
     await uploadUserAvatar(getUserAvatar(avatarId), newAvatarId);
@@ -1714,7 +1777,7 @@ async function migrateNonPersonaUser() {
         return;
     }
 
-    initPersona(user_avatar, name1, '');
+    initPersona(user_avatar, name1, '', '');
     setPersonaDescription();
     await getUserAvatars(true, user_avatar);
 }
@@ -1782,7 +1845,6 @@ function setNameCallback({ mode = 'all' }, name) {
         if (!persona) persona = Object.entries(power_user.personas).find(([_, personaName]) => personaName.toLowerCase() === name.toLowerCase())?.[1];
         if (persona) {
             autoSelectPersona(persona);
-            retriggerFirstMessageOnEmptyChat();
             return '';
         } else if (mode === 'lookup') {
             toastr.warning(`Persona ${name} not found`);
@@ -1793,7 +1855,6 @@ function setNameCallback({ mode = 'all' }, name) {
     if (['temp', 'all'].includes(mode)) {
         // Otherwise, set just the name
         setUserName(name); //this prevented quickReply usage
-        retriggerFirstMessageOnEmptyChat();
     }
 
     return '';
@@ -1818,7 +1879,7 @@ function registerPersonaSlashCommands() {
                 defaultValue: 'chat',
                 enumList: [
                     new SlashCommandEnumValue('chat', 'Lock the persona to the current chat.'),
-                    new SlashCommandEnumValue('character', 'Lock this persona to the currently selected character. If the setting is enabled, mutliple personas can be locked to the same character.'),
+                    new SlashCommandEnumValue('character', 'Lock this persona to the currently selected character. If the setting is enabled, multiple personas can be locked to the same character.'),
                     new SlashCommandEnumValue('default', 'Lock this persona as the default persona for all new chats.'),
                 ],
             }),
@@ -1854,7 +1915,7 @@ function registerPersonaSlashCommands() {
                 defaultValue: 'chat',
                 enumList: [
                     new SlashCommandEnumValue('chat', 'Lock the persona to the current chat.'),
-                    new SlashCommandEnumValue('character', 'Lock this persona to the currently selected character. If the setting is enabled, mutliple personas can be locked to the same character.'),
+                    new SlashCommandEnumValue('character', 'Lock this persona to the currently selected character. If the setting is enabled, multiple personas can be locked to the same character.'),
                     new SlashCommandEnumValue('default', 'Lock this persona as the default persona for all new chats.'),
                 ],
             }),
@@ -1944,9 +2005,6 @@ export async function initPersonas() {
     $(document).on('click', '#user_avatar_block .avatar-container', function () {
         const imgfile = $(this).attr('data-avatar-id');
         setUserAvatar(imgfile);
-
-        // force firstMes {{user}} update on persona switch
-        retriggerFirstMessageOnEmptyChat();
     });
 
     $('#persona_rename_button').on('click', () => renamePersona(user_avatar));
@@ -1970,7 +2028,7 @@ export async function initPersonas() {
 
     $('#char_connections_button').on('click', showCharConnections);
 
-    eventSource.on('charManagementDropdown', (target) => {
+    eventSource.on(event_types.CHARACTER_MANAGEMENT_DROPDOWN, (target) => {
         if (target === 'convert_to_persona') {
             convertCharacterToPersona();
         }
@@ -1979,4 +2037,3 @@ export async function initPersonas() {
     eventSource.on(event_types.CHAT_CHANGED, loadPersonaForCurrentChat);
     switchPersonaGridView();
 }
-

@@ -13,11 +13,13 @@ import mime from 'mime-types';
 import archiver from 'archiver';
 import _ from 'lodash';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
+import sanitize from 'sanitize-filename';
 
 import { USER_DIRECTORY_TEMPLATE, DEFAULT_USER, PUBLIC_DIRECTORIES, SETTINGS_FILE, UPLOADS_DIRECTORY } from './constants.js';
 import { getConfigValue, color, delay, generateTimestamp } from './util.js';
 import { readSecret, writeSecret } from './endpoints/secrets.js';
 import { getContentOfType } from './endpoints/content-manager.js';
+import { serverDirectory } from './server-directory.js';
 
 export const KEY_PREFIX = 'user:';
 const AVATAR_PREFIX = 'avatar:';
@@ -70,6 +72,7 @@ const STORAGE_KEYS = {
  * @property {string} thumbnails - The directory where the thumbnails are stored
  * @property {string} thumbnailsBg - The directory where the background thumbnails are stored
  * @property {string} thumbnailsAvatar - The directory where the avatar thumbnails are stored
+ * @property {string} thumbnailsPersona - The directory where the persona thumbnails are stored
  * @property {string} worlds - The directory where the WI are stored
  * @property {string} user - The directory where the user's public data is stored
  * @property {string} avatars - The directory where the avatars are stored
@@ -95,6 +98,7 @@ const STORAGE_KEYS = {
  * @property {string} vectors - The directory where the vectors are stored
  * @property {string} backups - The directory where the backups are stored
  * @property {string} sysprompt - The directory where the system prompt data is stored
+ * @property {string} reasoning - The directory where the reasoning templates are stored
  */
 
 /**
@@ -667,7 +671,7 @@ export async function getUserAvatar(handle) {
         if (!avatarFile) {
             return PUBLIC_USER_AVATAR;
         }
-        const avatarPath = path.join(directory.avatars, avatarFile);
+        const avatarPath = path.join(directory.avatars, sanitize(avatarFile));
         if (!fs.existsSync(avatarPath)) {
             return PUBLIC_USER_AVATAR;
         }
@@ -758,7 +762,7 @@ async function autheliaUserLogin(request) {
 
     const userHandles = await getAllUserHandles();
     for (const userHandle of userHandles) {
-        if (remoteUser === userHandle) {
+        if (remoteUser.toLowerCase() === userHandle) {
             const user = await storage.getItem(toKey(userHandle));
             if (user && user.enabled) {
                 request.session.handle = userHandle;
@@ -904,7 +908,7 @@ export async function loginPageMiddleware(request, response) {
         console.error('Error during auto-login:', error);
     }
 
-    return response.sendFile('login.html', { root: path.join(process.cwd(), 'public') });
+    return response.sendFile('login.html', { root: path.join(serverDirectory, 'public') });
 }
 
 /**
